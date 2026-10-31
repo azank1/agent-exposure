@@ -1,5 +1,5 @@
 name: agent-check
-description: Flag risky AI-agent setup committed to a repo, and agent workflows that outside issue or PR text can drive.
+description: Flag risky AI-agent setup, agent workflows that outside issue or PR text can drive, and Supabase tables open to the API.
 author: azank1
 branding:
   icon: shield
