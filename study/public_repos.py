@@ -91,12 +91,19 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--pages", type=int, default=3)
     ap.add_argument("--out", default=str(Path(__file__).resolve().parent / "out"))
+    ap.add_argument("--only", default="", help="comma-separated categories to re-sample; merged into the existing summary")
     a = ap.parse_args(argv)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    only = [c for c in a.only.split(",") if c]
     summary = {"date": datetime.date.today().isoformat(), "method": "GitHub code search sample, default branches, forks excluded", "categories": {}}
     triage = []
+    if only:
+        summary = json.loads((out / "summary.json").read_text())
+        triage = [t for t in json.loads((out / "triage.json").read_text()) if t["category"] not in only]
     for cat, query in CATEGORIES.items():
+        if only and cat not in only:
+            continue
         total, hits = search(query, a.pages)
         seen, unique = set(), []
         for repo, path in hits:
@@ -104,9 +111,10 @@ def main(argv=None):
                 seen.add((repo, path))
                 unique.append((repo, path))
         print(f"{cat}: {total} indexed, {len(unique)} sampled", file=sys.stderr)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(lambda rp: (rp, analyse(*rp)), unique))
         analysed = [(rp, f) for rp, f in results if f is not None]
+        print(f"{cat}: {len(analysed)} of {len(unique)} fetched", file=sys.stderr)
         repos = {rp[0] for rp, _ in analysed}
         by_rule, by_level, rule_level = collections.Counter(), collections.Counter(), collections.Counter()
         for (repo, path), findings in analysed:
