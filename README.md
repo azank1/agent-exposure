@@ -4,7 +4,7 @@
 
 [![release](https://img.shields.io/github/v/release/azank1/agent-exposure?color=0e7490&label=release)](https://github.com/azank1/agent-exposure/releases) [![tests](https://github.com/azank1/agent-exposure/actions/workflows/test.yml/badge.svg)](https://github.com/azank1/agent-exposure/actions/workflows/test.yml) [![license: MIT](https://img.shields.io/badge/license-MIT-0e7490)](LICENSE)
 
-![The agent-check job summary on a pull request: nine findings, from bypassPermissions in committed Claude Code settings to a Supabase table that anyone with the app's public key can change](docs/assets/report.png)
+![The agent-check job summary on a pull request: ten findings, from bypassPermissions in committed Claude Code settings to a Supabase policy that lets anyone with the app's public key change every row](docs/assets/report.png)
 
 <sub>The job summary on a pull request, from a demo repository with planted mistakes.</sub>
 
