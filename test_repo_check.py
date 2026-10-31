@@ -551,10 +551,18 @@ end $$;""")
     def test_policy_open_to_everyone_is_critical(self):
         f = self.findings("""create table public.leads (id int, email text);
 alter table public.leads enable row level security;
+grant select, insert, update, delete on public.leads to anon;
 create policy "Allow all operations" on public.leads for all using (true) with check (true);""")
-        self.assertEqual([(r, lv, line) for r, lv, _, line in f], [("rls-policy-always-true", "critical", 3)])
+        self.assertEqual([(r, lv, line) for r, lv, _, line in f], [("rls-policy-always-true", "critical", 4)])
         self.assertIn('policy "Allow all operations" on table public.leads lets anyone with the app\'s public key '
-                      "read, change and delete every row, and add rows", f[0][2])
+                      "read, change and delete every row, and add rows: row-level security is on", f[0][2])
+
+    def test_policy_open_to_everyone_without_grants_is_high(self):
+        f = self.findings("""create table sessions (id int);
+alter table sessions enable row level security;
+create policy "Host can update session" on sessions for update using (true);""")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-policy-always-true", "high")])
+        self.assertIn("anyone with the app's public key change every row wherever the table kept Supabase's grants", f[0][2])
 
     def test_policy_for_any_signed_in_user_is_high(self):
         f = self.findings("""create table posts (id int, author uuid);
@@ -598,7 +606,7 @@ do $$ begin
     create policy "open" on public.items for all using (true);
   end if;
 end $$;""")
-        self.assertEqual([(r, lv, line) for r, lv, _, line in f], [("rls-policy-always-true", "critical", 5)])
+        self.assertEqual([(r, lv, line) for r, lv, _, line in f], [("rls-policy-always-true", "high", 5)])
 
     def test_grants_bound_what_a_policy_opens(self):
         self.assertEqual(self.findings("""create table prices (id int);

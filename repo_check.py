@@ -707,9 +707,11 @@ def check_migrations(root, out, files, exposed):
                 level, who, acts = (("critical", "anyone with the app's public key", anyone) if anyone & {"update", "delete"} else
                                     ("high", "any signed-in user", signed) if signed & {"update", "delete"} else
                                     ("low", "anyone with the app's public key", {"insert"}) if "insert" in anyone else (None, None, None))
-                if level:
-                    found(out, level, pol["where"], "rls-policy-always-true",
-                          f'policy "{pname}" on table {label} lets {who} {say_actions(acts)}: row-level security is on, but '
+                if level:  # as with rls-off-table, critical needs the migrations themselves to grant the write
+                    found(out, level if explicit or level != "critical" else "high", pol["where"], "rls-policy-always-true",
+                          f'policy "{pname}" on table {label} lets {who} {say_actions(acts)}'
+                          + ("" if explicit else " wherever the table kept Supabase's grants from before 30 Oct 2026")
+                          + ": row-level security is on, but "
                           + ("the policy never checks whose row it is" if level != "low" else "nothing limits who adds what"))
 
 
