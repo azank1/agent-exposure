@@ -205,6 +205,9 @@ def check_workflows(root, out):
                 continue
             perms = job.get("permissions", doc.get("permissions"))
             steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
+            # actions/checkout leaves the job token in .git/config unless persist-credentials is false
+            persisted = any(str(s.get("uses", "")).startswith("actions/checkout")
+                            and str((s.get("with") or {}).get("persist-credentials", "true")).lower() != "false" for s in steps)
             for i, step in enumerate(steps):
                 uses = str(step.get("uses", ""))
                 run = str(step.get("run", ""))
@@ -216,7 +219,7 @@ def check_workflows(root, out):
                     add(out, "high", p, root, "shell-injection", f"job {job_id} pastes {m.group(0)} }}}} into a shell script: anyone who can set that text can run commands", m.group(0))
                 agent = agent_of(uses)
                 if agent:
-                    check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms)
+                    check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms, step.get("env"), persisted)
                 if run and untrusted:
                     env_text = " ".join(str(v) for scope in (doc.get("env"), job.get("env"), step.get("env")) if isinstance(scope, dict) for v in scope.values())
                     check_cli_agent(root, out, p, job_id, run, env_text, untrusted, perms)
@@ -294,12 +297,23 @@ def agent_of(uses):
     return next((label for prefix, label in AGENT_ACTIONS.items() if action == prefix or action.startswith(prefix + "/")), None)
 
 
-def check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms):
+def token_withheld(step_env, w):
+    """The agent step is explicitly given no GitHub token."""
+    env = {k: str(v).strip() for k, v in (step_env or {}).items()} if isinstance(step_env, dict) else {}
+    named = [k for k in ("GITHUB_TOKEN", "GH_TOKEN") if k in env]
+    return bool(named) and all(env[k] in ("", "''", '""') for k in named) \
+        and not any(w.get(k, "").strip() for k in ("github_token", "github-token"))
+
+
+def check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms, step_env=None, persisted=False):
     w = {k: str(v) for k, v in with_.items()}
     where = f"job {job_id} ({agent})"
     if untrusted:
         where += " on " + ", ".join(untrusted)
     scopes = write_scopes(perms)
+    withheld = token_withheld(step_env, w)
+    if withheld and not persisted:
+        scopes = []  # the job's write scopes belong to other steps; the agent gets no token
     strong = scopes is not None and any(sc == "write-all" or sc.split(":")[0] in STRONG_SCOPES for sc in scopes)
     unrestricted = []
     if w.get("safety-strategy") == "unsafe":
@@ -341,7 +355,10 @@ def check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms):
     if scopes is None:
         add(out, "low", p, root, "agent-default-token", f"{where}: no permissions block, so the token gets the repository default")
     elif scopes and untrusted and not open_keys:
-        add(out, "medium", p, root, "agent-write-on-untrusted", f"{where}: the agent reads text from outside contributors, with {', '.join(scopes)}", "permissions")
+        if withheld:
+            add(out, "low", p, root, "agent-write-on-untrusted", f"{where}: the agent step gets no token, but a checkout in this job leaves the job token ({', '.join(scopes)}) in .git/config", "persist-credentials")
+        else:
+            add(out, "medium", p, root, "agent-write-on-untrusted", f"{where}: the agent reads text from outside contributors, with {', '.join(scopes)}", "permissions")
 
 
 def check(root):

@@ -330,6 +330,42 @@ class CliAgent(unittest.TestCase):
         self.assertEqual(self.levels(CLI_AGENT_SAFE_WF), ["medium"])
 
 
+TOKEN_WITHHELD_WF = """
+on:
+  issues: {types: [opened]}
+permissions:
+  contents: read
+  issues: write
+  actions: write
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: google-github-actions/run-gemini-cli@v0
+        env:
+          GITHUB_TOKEN: ''
+        with:
+          prompt: Read issue_context.md and pick one label.
+"""
+
+
+class TokenWithheld(unittest.TestCase):
+    def findings(self, wf):
+        with tempfile.TemporaryDirectory() as d:
+            write(Path(d) / ".github/workflows/w.yml", wf)
+            return [(x["rule"], x["level"]) for x in json.loads(run(d, "--json", "--fail-on", "none").stdout)]
+
+    def test_agent_without_token_is_not_flagged(self):
+        self.assertEqual(self.findings(TOKEN_WITHHELD_WF), [])
+
+    def test_persisted_checkout_credentials_still_reported_low(self):
+        wf = TOKEN_WITHHELD_WF.replace("        with:\n          persist-credentials: false\n", "")
+        self.assertEqual(self.findings(wf), [("agent-write-on-untrusted", "low")])
+
+
 class CleanRepo(unittest.TestCase):
     def test_no_findings(self):
         with tempfile.TemporaryDirectory() as d:
