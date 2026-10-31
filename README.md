@@ -37,8 +37,11 @@ What it flags:
 
 - **committed Claude Code settings** that apply to every clone: `bypassPermissions`, `Bash(*)`-style allow rules, the dangerous-mode prompt switched off, `enableAllProjectMcpServers` (any server added to `.mcp.json` in a pull request starts without a prompt), a committed `settings.local.json`;
 - **MCP configs** (`.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`, `.gemini/settings.json`, `.codex/config.toml`): unpinned `npx`/`uvx` packages, and credentials written into the file instead of referenced as `${VAR}`;
-- **agent workflows** (`anthropics/claude-code-action`, `openai/codex-action`, `google-github-actions/run-gemini-cli`): anyone allowed to trigger the agent (`'*'`), sandbox or approval checks turned off, unrestricted shell tools, issue or PR text pasted into the prompt, write permissions on events that carry outside text, no `permissions:` block;
+- **agent workflows** (`anthropics/claude-code-action`, `openai/codex-action`, `google-github-actions/run-gemini-cli`): anyone allowed to trigger the agent (`'*'`), sandbox or approval checks turned off, unrestricted shell tools, issue or PR text pasted into the prompt, write permissions on events that carry outside text, no `permissions:` block. An agent step given an empty `GITHUB_TOKEN` is not charged with the job's write scopes, unless `actions/checkout` left credentials in `.git/config`;
+- **agent CLIs started from `run:` steps** (`claude -p`, `codex exec`, `gemini`, `aider` and others) on events that carry outside text, graded higher when approvals are skipped (`--yolo`, `--dangerously-skip-permissions`);
 - **the two classic workflow holes** on the same channel: checking out pull request code under `pull_request_target`, and `${{ github.event.issue.title }}`-style text inside `run:`.
+
+Severity follows what the job can actually do: checked-out pull request code that is never executed, or a job limited to trusted authors, grades lower. A workflow file that does not parse is reported, not skipped. Rates from a sample of 1,216 public files are in [`study/RESULTS.md`](study/RESULTS.md).
 
 For full GitHub Actions linting, run [zizmor](https://github.com/zizmorcore/zizmor) too; agent-check covers the agent layer.
 
