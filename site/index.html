@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; connect-src 'self' https://cdn.jsdelivr.net; img-src 'self' data:; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; base-uri 'none'; form-action 'none'">
+<title>Supabase migration check · agent-check</title>
+<meta name="description" content="See which tables, views and policies your Supabase migrations leave open to anyone with your app's public key. Runs in your browser; nothing is uploaded.">
+<meta property="og:title" content="Supabase migration check">
+<meta property="og:description" content="Drop your supabase folder and see which tables, views and policies your migrations leave open to the API. Runs in your browser; nothing is uploaded.">
+<meta property="og:image" content="https://azank1.github.io/agent-exposure/social-preview.png">
+<meta property="og:url" content="https://azank1.github.io/agent-exposure/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:creator" content="@azankhyder">
+<style>
+:root {
+  --bg: #f7f8fa; --surface: #ffffff; --text: #111827; --muted: #4b5563; --line: #e5e7eb;
+  --accent: #0e7490; --accent-soft: #e0f2f7; --code: #f1f5f9; --band: #0b1020; --band-text: #e5e9f2; --band-accent: #38bdf8;
+  --critical: #b42318; --high: #c2410c; --medium: #a16207; --low: #64748b;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b1020; --surface: #121a2e; --text: #e5e9f2; --muted: #9aa5b8; --line: #23304a;
+    --accent: #38bdf8; --accent-soft: #0f2a3d; --code: #0f172a; --band: #070b16;
+    --critical: #f97066; --high: #fb923c; --medium: #facc15; --low: #94a3b8;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.6 system-ui, -apple-system, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; }
+a { color: var(--accent); }
+code, textarea, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; }
+code { background: var(--code); padding: .1em .35em; border-radius: 5px; }
+.band { background: var(--band); color: var(--band-text); padding: 14px 20px; }
+.band .inner { max-width: 880px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.band a { color: var(--band-text); text-decoration: none; font-weight: 600; }
+.band a span { color: var(--band-accent); }
+.band nav a { font-weight: 400; color: #9aa5b8; margin-left: 16px; }
+main { max-width: 880px; margin: 0 auto; padding: 32px 20px 8px; }
+h1 { font-size: clamp(1.6rem, 4vw, 2.2rem); line-height: 1.2; margin: 0 0 12px; letter-spacing: -.01em; }
+.lead { color: var(--muted); font-size: 1.05rem; margin: 0 0 24px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+.drop { border: 2px dashed var(--line); border-radius: 10px; padding: 28px 16px; text-align: center; cursor: pointer; transition: border-color .15s, background .15s; }
+.drop:hover, .drop:focus-visible, .drop.over { border-color: var(--accent); background: var(--accent-soft); outline: none; }
+.drop strong { display: block; font-size: 1.1rem; margin-bottom: 4px; }
+.drop .muted { color: var(--muted); font-size: .92rem; }
+details { margin-top: 14px; }
+summary { cursor: pointer; color: var(--accent); font-weight: 500; }
+textarea { width: 100%; min-height: 150px; margin-top: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--code); color: var(--text); resize: vertical; }
+.actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; align-items: center; }
+button { font: inherit; font-weight: 600; border-radius: 8px; padding: 9px 16px; cursor: pointer; border: 1px solid var(--line); background: var(--surface); color: var(--text); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+@media (prefers-color-scheme: dark) { button.primary { color: #06202a; } }
+button:disabled { opacity: .55; cursor: progress; }
+#state { color: var(--muted); margin: 12px 0 0; min-height: 1.6em; }
+#state.error { color: var(--critical); }
+.privacy { font-size: .9rem; color: var(--muted); margin: 14px 0 0; }
+#results { margin-top: 28px; }
+#summary { font-weight: 700; font-size: 1.1rem; margin: 0 0 12px; }
+.scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; min-width: 560px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+tr:last-child td { border-bottom: 0; }
+td.where { white-space: nowrap; }
+.lvl { font-weight: 600; white-space: nowrap; }
+.lvl::before { content: ""; display: inline-block; width: .7em; height: .7em; border-radius: 50%; margin-right: .45em; background: currentColor; }
+.lvl.critical { color: var(--critical); } .lvl.high { color: var(--high); } .lvl.medium { color: var(--medium); } .lvl.low { color: var(--low); }
+@media (max-width: 640px) {
+  table { min-width: 0; }
+  thead { display: none; }
+  table, tbody, tr, td { display: block; }
+  tr { padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  tr:last-child { border-bottom: 0; }
+  td { border: 0; padding: 2px 0; }
+  td.where { white-space: normal; overflow-wrap: anywhere; }
+  td.lvl { display: inline-block; margin-right: 8px; }
+  td.where { display: inline; }
+  td:last-child { margin-top: 6px; }
+}
+h2 { font-size: 1.15rem; margin: 26px 0 8px; }
+#fixes li { margin: 6px 0; }
+.cta { margin-top: 22px; border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 14px 16px; border-radius: 8px; }
+.cta p { margin: 4px 0; }
+.clean { color: var(--accent); }
+.about { margin-top: 36px; color: var(--muted); font-size: .95rem; }
+.about h2 { color: var(--text); }
+footer { max-width: 880px; margin: 32px auto 0; padding: 18px 20px 40px; border-top: 1px solid var(--line); color: var(--muted); font-size: .88rem; }
+#selftest { position: fixed; right: 12px; bottom: 12px; padding: 8px 12px; border-radius: 8px; font-weight: 700; color: #fff; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<div class="band"><div class="inner">
+  <a href="https://github.com/azank1/agent-exposure">agent<span>-check</span></a>
+  <nav><a href="https://github.com/azank1/agent-exposure#add-it-to-a-repository">GitHub Action</a><a href="https://github.com/azank1/agent-exposure/blob/main/docs/fixes.md#supabase-migrations">Fixes</a></nav>
+</div></div>
+<main>
+  <h1>Is your Supabase app open to anyone with its public key?</h1>
+  <p class="lead">Since 30 October 2026, Supabase no longer exposes a new table to the API until it is granted, and the <code>permission denied for table</code> error suggests granting it to the role that asked, often <code>anon</code>. On a table with row-level security off, or with a policy that never checks whose row it is, that opens every row. Drop your project's <code>supabase</code> folder to see what your migrations leave open.</p>
+
+  <div class="card">
+    <div id="drop" class="drop" role="button" tabindex="0" aria-describedby="drop-help">
+      <strong>Drop your supabase folder here</strong>
+      <span id="drop-help" class="muted">or click to choose it. Only <code>migrations/*.sql</code>, <code>schemas/*.sql</code> and <code>config.toml</code> are read.</span>
+    </div>
+    <input id="pick" class="visually-hidden" type="file" webkitdirectory multiple aria-label="Choose your supabase folder">
+    <details id="paste-box"><summary>Or paste SQL</summary>
+      <label class="visually-hidden" for="sql">SQL to check</label>
+      <textarea id="sql" spellcheck="false" placeholder="create table public.profiles (...);&#10;alter table public.profiles enable row level security;"></textarea>
+    </details>
+    <div class="actions">
+      <button id="run" class="primary" type="button">Check the pasted SQL</button>
+      <button id="example" type="button">Try an example</button>
+    </div>
+    <p id="state" role="status" aria-live="polite"></p>
+    <p class="privacy">Your files never leave this page. The check runs in your browser with Pyodide; the only downloads are Pyodide from jsDelivr and agent-check's files from this site, and the page's content security policy blocks every other connection.</p>
+  </div>
+
+  <section id="results" hidden aria-labelledby="summary">
+    <p id="summary"></p>
+    <div class="scroll" id="table-wrap">
+      <table>
+        <thead><tr><th>level</th><th>where</th><th>finding</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <div id="fix-block">
+      <h2>How to fix</h2>
+      <ul id="fixes"></ul>
+      <p>The safe setting for each rule, with examples tested on Supabase's Postgres 17: <a href="https://github.com/azank1/agent-exposure/blob/main/docs/fixes.md#supabase-migrations">docs/fixes.md</a>.</p>
+    </div>
+    <div class="cta">
+      <p><strong>Catch it in every pull request.</strong> The same check runs as a GitHub Action: <a href="https://github.com/azank1/agent-exposure#add-it-to-a-repository">azank1/agent-exposure@v1</a>, free and MIT licensed.</p>
+      <p>Rather have them fixed? One fixed-price pull request: message <a href="https://x.com/azankhyder">@azankhyder on X</a>.</p>
+    </div>
+  </section>
+
+  <section class="about">
+    <h2>What it checks</h2>
+    <p>It replays your migrations in order, the way Postgres ran them, so a later <code>enable row level security</code>, rename, revoke, drop or <code>DO</code> loop counts. It flags tables in an exposed schema with row-level security off, default privileges that grant every new table to <code>anon</code>, views that skip row-level security because they lack <code>security_invoker</code>, and policies that let anyone, or any signed-in user, change or delete rows they don't own. Findings are graded by what the migrations grant.</p>
+    <p>It reads migrations, not your live database. Supabase's Security Advisor checks a project's database; this checks the SQL before it gets there. Every grade was reproduced in Supabase's Postgres 17 image.</p>
+  </section>
+</main>
+<footer>
+  <p>Checks from <a href="https://github.com/azank1/agent-exposure">agent-check</a> <span id="version"></span>, MIT licensed. It also flags risky AI-agent setup and CI agents that outside text can drive; those checks run in the GitHub Action.</p>
+</footer>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.27.7/full/pyodide.js"></script>
+<script>
+"use strict";
+const PYODIDE = "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/";
+const EXAMPLE = [
+  "create table public.profiles (id uuid primary key, email text, plan text);",
+  "grant select, insert, update, delete on public.profiles to anon, authenticated;",
+  "create table public.invoices (id uuid primary key, user_id uuid, amount numeric);",
+  "alter table public.invoices enable row level security;",
+  "create view public.revenue as select date_trunc('month', now()) as month, sum(amount) as total from public.invoices;",
+  "create policy \"Allow all\" on public.invoices for all using (true);",
+  "grant select, insert, update, delete on public.invoices to anon, authenticated;",
+].join("\n") + "\n";
+const MAX_FILE = 5 * 1024 * 1024, MAX_TOTAL = 50 * 1024 * 1024;
+const $ = (id) => document.getElementById(id);
+let pyReady = null, runs = 0;
+
+// Where a dropped file belongs under supabase/, or null to skip it. Mirrors check_supabase: migrations/*.sql,
+// schemas/*.sql and config.toml directly under a folder named supabase; a bare migrations folder or loose .sql files
+// are treated as supabase/migrations.
+function placeOf(path) {
+  const parts = path.split("/").filter(Boolean);
+  if (parts.some((p) => p === "node_modules" || p === ".git")) return null;
+  const name = parts[parts.length - 1] || "";
+  const at = parts.lastIndexOf("supabase");
+  if (at >= 0 && at < parts.length - 1) {
+    const rest = parts.slice(at + 1);
+    if (rest.length === 2 && (rest[0] === "migrations" || rest[0] === "schemas") && name.endsWith(".sql")) {
+      return { group: parts.slice(0, at).join("/"), rel: "supabase/" + rest.join("/") };
+    }
+    if (rest.length === 1 && name === "config.toml") return { group: parts.slice(0, at).join("/"), rel: "supabase/config.toml" };
+    return null;
+  }
+  const dir = parts[parts.length - 2];
+  if (parts.length >= 2 && (dir === "migrations" || dir === "schemas") && name.endsWith(".sql")) {
+    return { group: parts.slice(0, -2).join("/"), rel: "supabase/" + dir + "/" + name };
+  }
+  if (parts.length === 1 && name.endsWith(".sql")) return { group: "", rel: "supabase/migrations/" + name };
+  if (parts.length === 1 && name === "config.toml") return { group: "", rel: "supabase/config.toml" };
+  return null;
+}
+
+// Keep the supabase folder with the most SQL files when a drop holds several (a monorepo).
+function chooseFiles(items) {
+  const groups = new Map();
+  for (const it of items) {
+    const place = placeOf(it.path);
+    if (!place) continue;
+    if (!groups.has(place.group)) groups.set(place.group, []);
+    groups.get(place.group).push({ rel: place.rel, file: it.file, text: it.text });
+  }
+  let best = null, bestCount = -1;
+  for (const [group, files] of groups) {
+    const count = files.filter((f) => f.rel.endsWith(".sql")).length;
+    if (count > bestCount) { best = group; bestCount = count; }
+  }
+  return { files: best === null ? [] : groups.get(best), group: best, others: Math.max(0, groups.size - 1) };
+}
+
+function setState(text, error) {
+  $("state").textContent = text;
+  $("state").classList.toggle("error", Boolean(error));
+}
+
+function busy(on) {
+  for (const id of ["run", "example"]) $(id).disabled = on;
+}
+
+async function ensurePython() {
+  if (!pyReady) {
+    pyReady = (async () => {
+      const py = await loadPyodide({ indexURL: PYODIDE });
+      py.FS.mkdirTree("/agent-check");
+      for (const name of ["agent_exposure.py", "repo_check.py"]) {
+        const res = await fetch(name, { cache: "no-cache" });
+        if (!res.ok) throw new Error(name + ": HTTP " + res.status);
+        py.FS.writeFile("/agent-check/" + name, await res.text());
+      }
+      py.runPython("import sys; sys.path.insert(0, '/agent-check'); import repo_check");
+      return py;
+    })();
+    pyReady.catch(() => { pyReady = null; });
+  }
+  return pyReady;
+}
+
+async function check(files) {
+  setState(pyReady ? "Checking…" : "Loading the checker (about 10 MB, once)…");
+  const py = await ensurePython();
+  setState("Checking…");
+  const root = "/work/run" + (++runs);
+  for (const f of files) {
+    const full = root + "/" + f.rel;
+    py.FS.mkdirTree(full.slice(0, full.lastIndexOf("/")));
+    py.FS.writeFile(full, f.text);
+  }
+  py.globals.set("ROOT", root);
+  const result = py.runPython([
+    "import json, repo_check",
+    "from pathlib import Path",
+    "out = []",
+    "repo_check.check_supabase(Path(ROOT), out)",
+    "out.sort(key=lambda f: (-repo_check.LEVELS.index(f['level']), f['file'], f['line'] or 0))",
+    "json.dumps({'findings': out, 'fixes': {f['rule']: repo_check.FIXES.get(f['rule'], '') for f in out}})",
+  ].join("\n"));
+  return JSON.parse(result);
+}
+
+function cell(row, text, cls) {
+  const td = document.createElement("td");
+  if (cls) td.className = cls;
+  td.textContent = text;
+  row.appendChild(td);
+  return td;
+}
+
+function show(report, sqlCount, note) {
+  const levels = ["critical", "high", "medium", "low"];
+  const counts = levels.map((lv) => [lv, report.findings.filter((f) => f.level === lv).length]).filter(([, n]) => n);
+  const files = sqlCount + " migration file" + (sqlCount === 1 ? "" : "s");
+  const n = report.findings.length;
+  $("summary").textContent = n
+    ? n + " finding" + (n === 1 ? "" : "s") + " in " + files + ": " + counts.map(([lv, c]) => c + " " + lv).join(", ") + "."
+    : "Nothing open found in " + files + ". That covers what this checks, listed below, not every possible mistake.";
+  $("summary").className = n ? "" : "clean";
+  const rows = $("rows");
+  rows.replaceChildren();
+  for (const f of report.findings) {
+    const tr = document.createElement("tr");
+    cell(tr, f.level, "lvl " + f.level);
+    const where = cell(tr, "", "where");
+    const code = document.createElement("code");
+    code.textContent = f.file + (f.line ? ":" + f.line : "");
+    where.appendChild(code);
+    cell(tr, f.message);
+    rows.appendChild(tr);
+  }
+  $("table-wrap").hidden = !n;
+  $("fix-block").hidden = !n;
+  const fixes = $("fixes");
+  fixes.replaceChildren();
+  for (const [rule, text] of Object.entries(report.fixes)) {
+    const li = document.createElement("li");
+    const b = document.createElement("strong");
+    b.textContent = rule;
+    li.append(b, ": " + text);
+    fixes.appendChild(li);
+  }
+  $("results").hidden = false;
+  setState(note || "");
+}
+
+async function readText(file) {
+  if (file.size > MAX_FILE) throw new Error(file.name + " is over 5 MB");
+  return await file.text();
+}
+
+async function runFiles(items) {
+  const chosen = chooseFiles(items);
+  const sql = chosen.files.filter((f) => f.rel.endsWith(".sql"));
+  if (!sql.length) {
+    setState("No migrations found. Drop the supabase folder itself, its migrations folder, or .sql files.", true);
+    return;
+  }
+  let total = 0;
+  for (const f of chosen.files) {
+    if (f.text === undefined) f.text = await readText(f.file);
+    total += f.text.length;
+    if (total > MAX_TOTAL) throw new Error("the migrations are over 50 MB in total");
+  }
+  const note = chosen.others ? "Checked " + (chosen.group ? chosen.group + "/" : "") + "supabase; " + chosen.others + " other supabase folder" + (chosen.others === 1 ? " was" : "s were") + " skipped." : "";
+  show(await check(chosen.files), sql.length, note);
+}
+
+async function guarded(task) {
+  busy(true);
+  try { await task(); }
+  catch (e) { setState("Couldn't run the check: " + (e && e.message ? e.message : e), true); }
+  finally { busy(false); }
+}
+
+async function entriesToItems(entry, out) {
+  if (entry.isFile) {
+    const file = await new Promise((ok, fail) => entry.file(ok, fail));
+    out.push({ path: entry.fullPath.replace(/^\//, ""), file });
+  } else if (entry.isDirectory && entry.name !== "node_modules" && entry.name !== ".git") {
+    const reader = entry.createReader();
+    for (;;) {
+      const batch = await new Promise((ok, fail) => reader.readEntries(ok, fail));
+      if (!batch.length) break;
+      for (const e of batch) await entriesToItems(e, out);
+    }
+  }
+}
+
+const drop = $("drop");
+drop.addEventListener("click", () => $("pick").click());
+drop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $("pick").click(); } });
+drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", (e) => {
+  e.preventDefault();
+  drop.classList.remove("over");
+  const entries = [...e.dataTransfer.items].map((it) => it.webkitGetAsEntry && it.webkitGetAsEntry()).filter(Boolean);
+  guarded(async () => {
+    const items = [];
+    if (entries.length) for (const entry of entries) await entriesToItems(entry, items);
+    else for (const file of e.dataTransfer.files) items.push({ path: file.name, file });
+    await runFiles(items);
+  });
+});
+$("pick").addEventListener("change", (e) => {
+  const items = [...e.target.files].map((file) => ({ path: file.webkitRelativePath || file.name, file }));
+  e.target.value = "";
+  guarded(() => runFiles(items));
+});
+$("run").addEventListener("click", () => {
+  const text = $("sql").value;
+  if (!text.trim()) { $("paste-box").open = true; $("sql").focus(); setState("Paste the SQL of your migrations first.", true); return; }
+  guarded(async () => show(await check([{ rel: "supabase/migrations/pasted.sql", text }]), 1));
+});
+$("example").addEventListener("click", () => {
+  $("paste-box").open = true;
+  $("sql").value = EXAMPLE;
+  guarded(async () => show(await check([{ rel: "supabase/migrations/example.sql", text: EXAMPLE }]), 1, "This example has its mistakes planted on purpose."));
+});
+fetch("version.txt", { cache: "no-cache" }).then((r) => (r.ok ? r.text() : "")).then((v) => { $("version").textContent = v.trim(); }).catch(() => {});
+
+// #selftest=1 checks the page against the released code: path placement, then three migrations with known results.
+async function selftest() {
+  const results = [];
+  const expect = (name, ok) => results.push([name, Boolean(ok)]);
+  const place = (p) => { const r = placeOf(p); return r ? r.rel : null; };
+  expect("place: project root", place("myapp/supabase/migrations/001.sql") === "supabase/migrations/001.sql");
+  expect("place: supabase folder", place("supabase/config.toml") === "supabase/config.toml");
+  expect("place: bare migrations folder", place("migrations/001.sql") === "supabase/migrations/001.sql");
+  expect("place: loose file", place("001.sql") === "supabase/migrations/001.sql");
+  expect("place: skips app code", place("myapp/src/app.sql.ts") === null && place("myapp/supabase/seed.sql") === null);
+  expect("place: skips node_modules", place("myapp/node_modules/x/supabase/migrations/1.sql") === null);
+  const mono = chooseFiles([
+    { path: "repo/apps/a/supabase/migrations/1.sql", text: "" },
+    { path: "repo/apps/b/supabase/migrations/1.sql", text: "" },
+    { path: "repo/apps/b/supabase/migrations/2.sql", text: "" },
+  ]);
+  expect("monorepo: keeps the folder with more migrations", mono.group === "repo/apps/b" && mono.files.length === 2 && mono.others === 1);
+  const sig = (r) => r.findings.map((f) => [f.level, f.rule, f.line].join(" ")).join(" | ");
+  const ex = await check([{ rel: "supabase/migrations/example.sql", text: EXAMPLE }]);
+  expect("example: 3 findings", sig(ex) === "critical rls-off-table 1 | critical rls-policy-always-true 6 | high view-bypasses-rls 5");
+  const clean = await check([{ rel: "supabase/migrations/notes.sql", text: [
+    "create table public.notes (id uuid primary key, user_id uuid not null, body text);",
+    "alter table public.notes enable row level security;",
+    "create policy \"Owners read their notes\" on public.notes for select to authenticated using (user_id = (select auth.uid()));",
+    "create policy \"Owners change their notes\" on public.notes for update to authenticated using (user_id = (select auth.uid()));",
+    "grant select, update on public.notes to authenticated;"].join("\n") }]);
+  expect("owner policies: no findings", clean.findings.length === 0);
+  const cfg = await check([
+    { rel: "supabase/config.toml", text: "[api]\nschemas = [\"api\"]\n" },
+    { rel: "supabase/migrations/001_ledger.sql", text: "create table public.ledger (id int primary key, amount numeric);\ngrant select, insert, update, delete on public.ledger to anon;\n" }]);
+  expect("config.toml: public not exposed, so no findings", cfg.findings.length === 0);
+  show(ex, 1, "Self-test ran the example.");
+  const passed = results.filter(([, ok]) => ok).length, failed = results.filter(([, ok]) => !ok).map(([n]) => n);
+  const badge = document.createElement("div");
+  badge.id = "selftest";
+  badge.style.background = failed.length ? "#b42318" : "#0e7490";
+  badge.textContent = (failed.length ? "SELFTEST FAIL " : "SELFTEST PASS ") + passed + "/" + results.length + (failed.length ? ": " + failed.join("; ") : "");
+  document.body.appendChild(badge);
+  document.title = badge.textContent;
+}
+if (location.hash === "#selftest=1") guarded(selftest);
+if (location.hash === "#example=1") $("example").click();
+</script>
+</body>
+</html>
