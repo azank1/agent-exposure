@@ -204,7 +204,7 @@ def check_workflows(root, out):
                 run = str(step.get("run", ""))
                 with_ = step.get("with") if isinstance(step.get("with"), dict) else {}
                 if "pull_request_target" in events and uses.startswith("actions/checkout") and PR_HEAD_REF.search(str(with_.get("ref", ""))):
-                    check_pr_checkout(root, out, p, job_id, job, steps[i + 1:], str(with_.get("ref")), perms)
+                    check_pr_checkout(root, out, p, job_id, job, steps[i + 1:], with_, perms)
                 m = UNTRUSTED_TEXT.search(run)
                 if m:
                     add(out, "high", p, root, "shell-injection", f"job {job_id} pastes {m.group(0)} }}}} into a shell script: anyone who can set that text can run commands", m.group(0))
@@ -213,10 +213,24 @@ def check_workflows(root, out):
                     check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms)
 
 
-def check_pr_checkout(root, out, p, job_id, job, later, ref, perms):
+def check_pr_checkout(root, out, p, job_id, job, later, checkout, perms):
     """Pull request code checked out in a privileged pull_request_target job: grade by what runs on it."""
-    runs = [str(st.get("run", "")) for st in later]
-    executes = any(EXEC_PR_CODE.search(r) for r in runs) or any(str(st.get("uses", "")).startswith("./") for st in later)
+    pr_dir = str(checkout.get("path") or "").strip().strip("./")
+
+    def on_pr_code(st):
+        # PR code checked out into a subdirectory only runs if a later step points at that directory.
+        if not pr_dir:
+            return True
+        wd = str(st.get("working-directory", "")).strip().strip("./")
+        if wd == pr_dir or wd.startswith(pr_dir + "/"):
+            return True
+        text = str(st.get("run", "")) + " " + str(st.get("uses", ""))
+        d = re.escape(pr_dir)
+        return re.search(r"(?:^|[\s\"'=])(?:\./)?" + d + r"/|\bcd\s+(?:\./)?" + d + r"\b", text) is not None
+
+    touched = [st for st in later if on_pr_code(st)]
+    executes = (any(EXEC_PR_CODE.search(str(st.get("run", ""))) for st in touched)
+                or any(str(st.get("uses", "")).startswith("./") for st in touched))
     agents = [st for st in later if agent_of(str(st.get("uses", "")))]
     gated = bool(TRUSTED_GATE.search(str(job.get("if", "")))) or "environment" in job
     scopes = write_scopes(perms)
@@ -234,7 +248,7 @@ def check_pr_checkout(root, out, p, job_id, job, later, ref, perms):
     if gated:
         level = LEVELS[max(0, LEVELS.index(level) - 1)]
         what += "; the job is limited to trusted authors or a protected environment"
-    add(out, level, p, root, "pwn-request", f"job {job_id} checks out pull request code under pull_request_target, {what}", ref)
+    add(out, level, p, root, "pwn-request", f"job {job_id} checks out pull request code under pull_request_target, {what}", str(checkout.get("ref")))
 
 
 def agent_of(uses):

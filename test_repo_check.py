@@ -244,6 +244,27 @@ jobs:
 """
 
 
+PR_IN_SUBDIR_WF = """
+on: pull_request_target
+permissions:
+  contents: read
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - run: python3 .github/scripts/summarise.py
+"""
+
+PR_IN_SUBDIR_EXECUTED_WF = PR_IN_SUBDIR_WF.replace("python3 .github/scripts/summarise.py", "cd pr && npm ci && npm test")
+
+
 class PrCheckoutGrading(unittest.TestCase):
     def level(self, wf):
         with tempfile.TemporaryDirectory() as d:
@@ -252,6 +273,10 @@ class PrCheckoutGrading(unittest.TestCase):
 
     def test_read_only_agent_over_pr_code_is_medium(self):
         self.assertEqual(self.level(AGENT_READS_PR_WF), ["medium"])
+
+    def test_pr_code_in_subdirectory_only_counts_when_used(self):
+        self.assertEqual(self.level(PR_IN_SUBDIR_WF), ["medium"])
+        self.assertEqual(self.level(PR_IN_SUBDIR_EXECUTED_WF), ["critical"])
 
     def test_trusted_author_gate_lowers_one_level(self):
         self.assertEqual(self.level(GATED_EXEC_WF), ["high"])
