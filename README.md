@@ -43,6 +43,8 @@ What it flags:
 
 Severity follows what the job can actually do: checked-out pull request code that is never executed, or a job limited to trusted authors, grades lower. A workflow file that does not parse is reported, not skipped.
 
+How to fix each finding, with the safe setting: [`docs/fixes.md`](docs/fixes.md).
+
 For full GitHub Actions linting, run [zizmor](https://github.com/zizmorcore/zizmor) too; agent-check covers the agent layer.
 
 ## agent-exposure: on a developer machine
