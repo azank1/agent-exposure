@@ -523,6 +523,27 @@ end $$;""")
         self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "high")])
         self.assertIn("public.forgotten", f[0][2])
 
+    def test_catalog_loop_filtered_by_relation_kind_covers_every_table(self):
+        self.assertEqual(self.findings("""create table a (id int);
+create table b (id int);
+do $m$ declare target text; begin
+  for target in select format('%I.%I', n.nspname, c.relname) from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                where n.nspname = 'public' and c.relkind in ('r', 'p') loop
+    execute format('alter table %s enable row level security', target);
+  end loop;
+end $m$;"""), [])
+
+    def test_catalog_loop_filtered_by_table_name_covers_only_those(self):
+        f = self.findings("""create table a (id int);
+create table b (id int);
+do $$ declare r record; begin
+  for r in select tablename from pg_tables where schemaname = 'public' and tablename in ('a') loop
+    execute format('alter table public.%I enable row level security', r.tablename);
+  end loop;
+end $$;""")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "high")])
+        self.assertIn("public.b", f[0][2])
+
     def test_do_block_with_a_literal_statement(self):
         self.assertEqual(self.findings("create table public.audit (id int);\n"
                                        "do $$ begin execute 'alter table public.audit enable row level security'; end $$;"), [])
