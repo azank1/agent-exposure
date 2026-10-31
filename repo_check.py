@@ -31,6 +31,8 @@ UNTRUSTED_TEXT = re.compile(
     r"\$\{\{\s*github\.(?:event\.(?:issue\.(?:title|body)|comment\.body|review\.body|review_comment\.body"
     r"|pull_request\.(?:title|body|head\.ref|head\.label)|discussion\.(?:title|body)|head_commit\.message)"
     r"|head_ref)\b")
+EXEC_PR_CODE = re.compile(r"\b(?:npm|yarn|pnpm|bun|npx|node|make|pip3?|poetry|uv|python3?|pytest|tox|cargo|go|mvn|gradle|bundle|rake|composer)\s+(?!--version)\S|(?:^|[\s;&|])\./[\w./-]+|\b(?:bash|sh)\s+[\w./-]+\.sh\b", re.M)
+TRUSTED_GATE = re.compile(r"author_association|github\.actor\s*==|user\.login\s*==|head\.repo\.full_name\s*==\s*github\.repository|head\.repo\.fork\s*==\s*false|label\.name\s*==")
 STRONG_SCOPES = {"contents", "actions", "packages", "deployments", "pages"}
 PR_HEAD_REF = re.compile(r"github\.(?:event\.pull_request\.head\.(?:sha|ref)|head_ref)|refs/pull/")
 AGENT_ACTIONS = {
@@ -202,18 +204,37 @@ def check_workflows(root, out):
                 run = str(step.get("run", ""))
                 with_ = step.get("with") if isinstance(step.get("with"), dict) else {}
                 if "pull_request_target" in events and uses.startswith("actions/checkout") and PR_HEAD_REF.search(str(with_.get("ref", ""))):
-                    later = [agent_of(str(s.get("uses", ""))) or ("a script" if s.get("run") else None) for s in steps[i + 1:]]
-                    later = [x for x in later if x]
-                    if later:
-                        add(out, "critical", p, root, "pwn-request", f"job {job_id} checks out pull request code under pull_request_target, then runs {later[0]} over it with the base repo's secrets: the PR author controls what it reads and may run", str(with_.get("ref")))
-                    else:
-                        add(out, "high", p, root, "pwn-request", f"job {job_id} checks out pull request code under pull_request_target, a job that holds the base repo's secrets", str(with_.get("ref")))
+                    check_pr_checkout(root, out, p, job_id, job, steps[i + 1:], str(with_.get("ref")), perms)
                 m = UNTRUSTED_TEXT.search(run)
                 if m:
                     add(out, "high", p, root, "shell-injection", f"job {job_id} pastes {m.group(0)} }}}} into a shell script: anyone who can set that text can run commands", m.group(0))
                 agent = agent_of(uses)
                 if agent:
                     check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms)
+
+
+def check_pr_checkout(root, out, p, job_id, job, later, ref, perms):
+    """Pull request code checked out in a privileged pull_request_target job: grade by what runs on it."""
+    runs = [str(st.get("run", "")) for st in later]
+    executes = any(EXEC_PR_CODE.search(r) for r in runs) or any(str(st.get("uses", "")).startswith("./") for st in later)
+    agents = [st for st in later if agent_of(str(st.get("uses", "")))]
+    gated = bool(TRUSTED_GATE.search(str(job.get("if", "")))) or "environment" in job
+    scopes = write_scopes(perms)
+    if executes:
+        level, what = "critical", "then runs build, test or local-action code from it"
+    elif agents:
+        w = {k: str(v) for st in agents for k, v in (st.get("with") or {}).items()}
+        env = {k for st in agents for k in (st.get("env") or {})}
+        strong = (w.get("sandbox") == "danger-full-access" or w.get("safety-strategy") == "unsafe"
+                  or env & {"GH_TOKEN", "GITHUB_TOKEN"} or scopes is None or bool(scopes))
+        level = "high" if strong else "medium"
+        what = "then has an agent read it" + (" with write access or no sandbox" if strong else " in a read-only job")
+    else:
+        level, what = "medium", "in a job that holds the base repo's token"
+    if gated:
+        level = LEVELS[max(0, LEVELS.index(level) - 1)]
+        what += "; the job is limited to trusted authors or a protected environment"
+    add(out, level, p, root, "pwn-request", f"job {job_id} checks out pull request code under pull_request_target, {what}", ref)
 
 
 def agent_of(uses):

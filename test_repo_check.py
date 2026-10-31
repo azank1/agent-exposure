@@ -51,6 +51,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+      - run: npm ci && npm test
       - uses: openai/codex-action@v1
         with:
           safety-strategy: unsafe
@@ -205,9 +206,55 @@ class Calibration(unittest.TestCase):
     def test_claude_open_users_need_github_token(self):
         self.assertFalse([x for x in self.findings(CLAUDE_NO_TOKEN_WF) if x["rule"] == "agent-open-to-anyone"])
 
-    def test_checkout_without_execution_is_high(self):
+    def test_checkout_without_execution_is_medium(self):
         f = [x for x in self.findings(CHECKOUT_ONLY_WF) if x["rule"] == "pwn-request"]
-        self.assertEqual([x["level"] for x in f], ["high"])
+        self.assertEqual([x["level"] for x in f], ["medium"])
+
+
+AGENT_READS_PR_WF = """
+on: pull_request_target
+permissions:
+  contents: read
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+      - run: git fetch --no-tags origin main
+      - uses: openai/codex-action@v1
+        with:
+          sandbox: read-only
+"""
+
+GATED_EXEC_WF = """
+on: pull_request_target
+permissions:
+  contents: read
+jobs:
+  test:
+    if: github.event.pull_request.author_association == 'MEMBER'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: npm ci && npm test
+"""
+
+
+class PrCheckoutGrading(unittest.TestCase):
+    def level(self, wf):
+        with tempfile.TemporaryDirectory() as d:
+            write(Path(d) / ".github/workflows/w.yml", wf)
+            return [x["level"] for x in json.loads(run(d, "--json", "--fail-on", "none").stdout) if x["rule"] == "pwn-request"]
+
+    def test_read_only_agent_over_pr_code_is_medium(self):
+        self.assertEqual(self.level(AGENT_READS_PR_WF), ["medium"])
+
+    def test_trusted_author_gate_lowers_one_level(self):
+        self.assertEqual(self.level(GATED_EXEC_WF), ["high"])
 
 
 class CleanRepo(unittest.TestCase):
