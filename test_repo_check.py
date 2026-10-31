@@ -282,6 +282,54 @@ class PrCheckoutGrading(unittest.TestCase):
         self.assertEqual(self.level(GATED_EXEC_WF), ["high"])
 
 
+CLI_AGENT_WF = """
+on:
+  issues: {types: [opened]}
+permissions:
+  contents: write
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    env:
+      ISSUE_BODY: ${{ github.event.issue.body }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          npx -y @google/gemini-cli --yolo -p "Triage this issue: $ISSUE_BODY"
+"""
+
+CLI_AGENT_SAFE_WF = """
+on:
+  issues: {types: [opened]}
+permissions:
+  contents: read
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npx -y @google/gemini-cli -p "Summarise the open issues"
+"""
+
+
+class CliAgent(unittest.TestCase):
+    def levels(self, wf):
+        with tempfile.TemporaryDirectory() as d:
+            write(Path(d) / ".github/workflows/w.yml", wf)
+            return [x["level"] for x in json.loads(run(d, "--json", "--fail-on", "none").stdout) if x["rule"] == "cli-agent-on-untrusted"]
+
+    def test_yolo_cli_with_issue_text_and_write_token_is_critical(self):
+        self.assertEqual(self.levels(CLI_AGENT_WF), ["critical"])
+
+    def test_unparseable_workflow_is_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            write(Path(d) / ".github/workflows/w.yml", "on: push\njobs:\n  x:\n    steps:\n      - run: echo a: b: c\n")
+            rules = [x["rule"] for x in json.loads(run(d, "--json", "--fail-on", "none").stdout)]
+            self.assertEqual(rules, ["unparsed-workflow"])
+
+    def test_npx_y_is_not_yolo(self):
+        self.assertEqual(self.levels(CLI_AGENT_SAFE_WF), ["medium"])
+
+
 class CleanRepo(unittest.TestCase):
     def test_no_findings(self):
         with tempfile.TemporaryDirectory() as d:

@@ -30,7 +30,7 @@ CATEGORIES = {
     "codex-action": "openai/codex-action path:.github/workflows",
     "gemini-action": "run-gemini-cli path:.github/workflows",
 }
-IGNORED_RULES = {"no-codeowners", "skipped"}  # only single files are fetched, so these say nothing
+IGNORED_RULES = {"no-codeowners", "skipped", "unparsed-workflow"}  # only single files are fetched, so these say nothing
 
 
 def gh(args, accept=None):

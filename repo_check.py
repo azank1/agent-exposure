@@ -33,6 +33,8 @@ UNTRUSTED_TEXT = re.compile(
     r"|head_ref)\b")
 EXEC_PR_CODE = re.compile(r"\b(?:npm|yarn|pnpm|bun|npx|node|make|pip3?|poetry|uv|python3?|pytest|tox|cargo|go|mvn|gradle|bundle|rake|composer)\s+(?!--version)\S|(?:^|[\s;&|])\./[\w./-]+|\b(?:bash|sh)\s+[\w./-]+\.sh\b", re.M)
 TRUSTED_GATE = re.compile(r"author_association|github\.actor\s*==|user\.login\s*==|head\.repo\.full_name\s*==\s*github\.repository|head\.repo\.fork\s*==\s*false|label\.name\s*==")
+AGENT_CLI = re.compile(r"(?:^|[\s;&|(])(?:npx\s+)?(@anthropic-ai/claude-code|claude|@openai/codex|codex|@google/gemini-cli|gemini|aider|opencode|goose|cursor-agent|qwen|copilot)(?:@[\w.^~-]+)?\s+(?:-p\b|--print\b|exec\b|run\b|--prompt\b|--message\b|--yolo\b|-y\b|--approval-mode\b|--yes\b)", re.M)
+DANGEROUS_CLI_FLAGS = re.compile(r"--yolo\b|(?:^|\s)-y(?=\s|$)|--approval-mode[= ]+yolo\b|--dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox|--full-auto\b|--allow-all-tools\b|--permission-mode[= ]+bypassPermissions|--yes-always\b", re.M)
 STRONG_SCOPES = {"contents", "actions", "packages", "deployments", "pages"}
 PR_HEAD_REF = re.compile(r"github\.(?:event\.pull_request\.head\.(?:sha|ref)|head_ref)|refs/pull/")
 AGENT_ACTIONS = {
@@ -62,6 +64,7 @@ FIXES = {
     "untrusted-text-in-prompt": "Do not paste issue or PR text into the prompt; let the agent read it as data with read-only permissions.",
     "agent-write-on-untrusted": "Give the agent job read-only permissions, and do any writes in a separate job after review.",
     "agent-default-token": "Add an explicit permissions: block with the least the job needs.",
+    "cli-agent-on-untrusted": "Run the agent CLI read-only with approvals on, pass outside text as a file it reads as data, and post results from a separate step that holds the token.",
 }
 
 
@@ -187,7 +190,10 @@ def check_workflows(root, out):
     for p in files:
         try:
             doc = yaml.safe_load(p.read_text(encoding="utf-8", errors="ignore"))
-        except yaml.YAMLError:
+        except yaml.YAMLError as e:
+            mark = getattr(e, "problem_mark", None)
+            out.append({"level": "low", "file": os.path.relpath(p, root), "line": mark.line + 1 if mark else None,
+                        "rule": "unparsed-workflow", "message": "workflow could not be parsed, so it was not checked"})
             continue
         if not isinstance(doc, dict):
             continue
@@ -211,6 +217,9 @@ def check_workflows(root, out):
                 agent = agent_of(uses)
                 if agent:
                     check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms)
+                if run and untrusted:
+                    env_text = " ".join(str(v) for scope in (doc.get("env"), job.get("env"), step.get("env")) if isinstance(scope, dict) for v in scope.values())
+                    check_cli_agent(root, out, p, job_id, run, env_text, untrusted, perms)
 
 
 def check_pr_checkout(root, out, p, job_id, job, later, checkout, perms):
@@ -249,6 +258,35 @@ def check_pr_checkout(root, out, p, job_id, job, later, checkout, perms):
         level = LEVELS[max(0, LEVELS.index(level) - 1)]
         what += "; the job is limited to trusted authors or a protected environment"
     add(out, level, p, root, "pwn-request", f"job {job_id} checks out pull request code under pull_request_target, {what}", str(checkout.get("ref")))
+
+
+def check_cli_agent(root, out, p, job_id, run, env_text, untrusted, perms):
+    """An agent CLI started from a shell step on events whose text outsiders write."""
+    cmd = re.sub(r"\bnpx\s+(?:--yes|-y)\b", "npx", run)
+    m = AGENT_CLI.search(cmd)
+    if not m:
+        return
+    name = m.group(1)
+    dangerous = DANGEROUS_CLI_FLAGS.search(cmd)
+    text_in = UNTRUSTED_TEXT.search(env_text)
+    scopes = write_scopes(perms)
+    strong = scopes is not None and any(sc == "write-all" or sc.split(":")[0] in STRONG_SCOPES for sc in scopes)
+    if dangerous and text_in and (strong or scopes is None):
+        level = "critical"
+    elif dangerous or (text_in and (scopes is None or scopes)):
+        level = "high"
+    else:
+        level = "medium"
+    parts = [f"job {job_id} runs the {name} CLI on " + ", ".join(untrusted)]
+    if text_in:
+        parts.append(f"with {text_in.group(0)} }}}} in its environment")
+    if dangerous:
+        parts.append(f"with approvals off ({dangerous.group(0).strip()})")
+    if scopes is None:
+        parts.append("with the repository's default token")
+    elif scopes:
+        parts.append("with " + ", ".join(scopes))
+    add(out, level, p, root, "cli-agent-on-untrusted", ", ".join(parts), m.group(0).strip())
 
 
 def agent_of(uses):
