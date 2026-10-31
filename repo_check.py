@@ -72,9 +72,14 @@ NOT_A_RELATION = re.compile(r"(?:all\s+)?(?:sequences?|functions?|procedures?|ro
 SECURITY_INVOKER = re.compile(r"security_invoker\s*(?:=\s*(?:true|on|1|yes)\b|(?=[,)]))", re.I)
 ENABLE_RLS = re.compile(r"enable\s+row\s+level\s+security", re.I)
 EVERY_TABLE = re.compile(r"\bpg_tables\b|information_schema\.tables|\bpg_class\b", re.I)
-TABLE_FILTER = re.compile(r"\b(?:tablename|table_name|relname)\s*(?:in\s*\(|=\s*any\s*\(\s*array\s*\[)([^\])]*)", re.I)
-LISTED = re.compile(r"(?:array\s*\[|\bin\s*\()([^\])]*)[\])]", re.I)
-LITERAL_RLS = re.compile(rf"'\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?{SQL_QNAME}\s+enable\s+row\s+level\s+security", re.I)
+DYNAMIC_RLS = re.compile(r"alter\s+table\s[^;]*?(?:%|\|\|)[^;]*?enable\s+row\s+level\s+security", re.I)
+NAME_COLUMN = r"\b(?:tablename|table_name|relname)\b\s*"
+NAME_FILTER = re.compile(NAME_COLUMN + r"(?:=|in\s*\()", re.I)
+NAME_EQUALS = re.compile(NAME_COLUMN + r"=\s*('[^']*')", re.I)
+NAME_SKIPPED = re.compile(NAME_COLUMN + r"(?:not\s+in\s*\(([^)]*)\)|(?:<>|!=)\s*('[^']*'))", re.I)
+SCHEMA_EQUALS = re.compile(r"\b(?:schemaname|table_schema|nspname|relnamespace)\b\s*=\s*'([^']*)'", re.I)
+LISTED = re.compile(r"(?:array\s*\[|(?<!\bnot\s)\bin\s*\()([^\])]*)[\])]", re.I)
+SPELLED_RLS = re.compile(rf"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?{SQL_QNAME}\s+enable\s+row\s+level\s+security", re.I)
 DML = ("select", "insert", "update", "delete")
 
 FIXES = {
@@ -455,14 +460,16 @@ def sql_roles(text):
 
 
 def rls_loop_targets(body):
-    """The tables a DO block switches row-level security on for: the names it lists or spells out, or None when it
-    loops over the catalog (every table)."""
+    """The tables a DO block switches row-level security on for, as (every, names, schemas): the names it lists or
+    spells out, or for a loop over the catalog, every table in the schemas it reads except the names it skips."""
     if not ENABLE_RLS.search(body):
-        return set()
+        return False, set(), set()
     quoted = lambda groups: {n for g in groups for n in re.findall(r"'([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?)'", g)}
-    if EVERY_TABLE.search(body):  # a loop over the catalog: every table, unless it filters on table names
-        return quoted(TABLE_FILTER.findall(body)) or None
-    return quoted(LISTED.findall(body)) | {f"{m.group(1) or 'public'}.{m.group(2)}" for m in LITERAL_RLS.finditer(body)}
+    listed = quoted(LISTED.findall(body)) | quoted(NAME_EQUALS.findall(body))
+    # a loop over the catalog builds its statement per table, and keeps every table unless it filters on listed names
+    if EVERY_TABLE.search(body) and DYNAMIC_RLS.search(body) and not (NAME_FILTER.search(body) and listed):
+        return True, quoted("".join(g) for g in NAME_SKIPPED.findall(body)), set(SCHEMA_EQUALS.findall(body))
+    return False, listed | {f"{m.group(1) or 'public'}.{m.group(2)}" for m in SPELLED_RLS.finditer(body)}, set()
 
 
 def found(out, level, where, rule, message):
@@ -504,9 +511,10 @@ def check_migrations(root, out, files, exposed):
                 auto_rls = True  # an event-trigger function that switches RLS on for each new table
             if re.match(r"do\b", stmt, re.I):
                 for b in inside:
-                    targets = rls_loop_targets(b)
-                    if targets is None:  # a loop over the catalog: every existing table
-                        targets = [f"{k[0]}.{k[1]}" for k, r in rels.items() if r["kind"] == "table"]
+                    every, targets, schemas = rls_loop_targets(b)
+                    if every:  # a loop over the catalog: every existing table in the schemas it reads, bar the skipped
+                        targets = [f"{k[0]}.{k[1]}" for k, r in rels.items() if r["kind"] == "table"
+                                   and (not schemas or k[0] in schemas) and not {k[1], f"{k[0]}.{k[1]}"} & targets]
                     for t in targets:
                         schema, _, name = t.rpartition(".")
                         for key in ((schema.strip('"') or "public", name.strip('"')), (schema.strip('"').lower() or "public", name.strip('"').lower())):

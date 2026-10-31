@@ -548,6 +548,75 @@ end $$;""")
         self.assertEqual(self.findings("create table public.audit (id int);\n"
                                        "do $$ begin execute 'alter table public.audit enable row level security'; end $$;"), [])
 
+    def test_existence_check_covers_only_the_table_it_names(self):
+        f = self.findings("""create table plans (id int);
+create table documents (id int);
+do $$ begin
+  if exists (select 1 from information_schema.tables where table_schema = 'public' and table_name = 'documents') then
+    execute 'alter table public.documents enable row level security';
+  end if;
+end $$;""")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "high")])
+        self.assertIn("public.plans", f[0][2])
+
+    def test_plain_statement_after_a_catalog_check(self):
+        f = self.findings("""create table a (id int);
+create table b (id int);
+do $$ begin
+  if not (select relrowsecurity from pg_class where oid = 'public.a'::regclass) then
+    alter table public.a enable row level security;
+  end if;
+end $$;""")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "high")])
+        self.assertIn("public.b", f[0][2])
+
+    def test_array_loop_with_a_catalog_check_covers_only_the_array(self):
+        f = self.findings("""create table a (id int);
+create table b (id int);
+create table c (id int);
+do $$ declare t text; begin
+  foreach t in array array['a', 'b'] loop
+    if exists (select 1 from pg_tables where schemaname = 'public' and tablename = t) then
+      execute format('alter table public.%I enable row level security', t);
+    end if;
+  end loop;
+end $$;""")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "high")])
+        self.assertIn("public.c", f[0][2])
+
+    def test_catalog_loop_joined_on_names_covers_every_table(self):
+        self.assertEqual(self.findings("""create table a (id int);
+create table b (id int);
+do $$ declare r record; begin
+  for r in select t.tablename from pg_tables t join pg_class c on c.relname = t.tablename
+           where t.schemaname = 'public' and not c.relrowsecurity loop
+    execute 'alter table public.' || quote_ident(r.tablename) || ' enable row level security';
+  end loop;
+end $$;"""), [])
+
+    def test_catalog_loop_leaves_the_tables_it_skips(self):
+        f = self.findings("""create table a (id int);
+create table skipped (id int);
+do $$ declare r record; begin
+  for r in select tablename from pg_tables where schemaname = 'public' and tablename not in ('skipped') loop
+    execute format('alter table public.%I enable row level security', r.tablename);
+  end loop;
+end $$;""")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "high")])
+        self.assertIn("public.skipped", f[0][2])
+
+    def test_catalog_loop_over_another_schema_leaves_public_tables(self):
+        f = self.findings("""create table public.a (id int);
+create schema app;
+create table app.b (id int);
+do $$ declare r record; begin
+  for r in select tablename from pg_tables where schemaname = 'app' loop
+    execute format('alter table app.%I enable row level security', r.tablename);
+  end loop;
+end $$;""")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "high")])
+        self.assertIn("public.a", f[0][2])
+
     def test_event_trigger_enabling_rls_on_new_tables(self):
         self.assertEqual(self.findings("""create or replace function rls_auto_enable() returns event_trigger language plpgsql as $fn$
 declare cmd record;
