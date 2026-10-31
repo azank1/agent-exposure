@@ -2,7 +2,7 @@
 
 What can your AI coding agents reach, and who can tell them what to do?
 
-Two read-only checks, stdlib Python, no telemetry. Neither ever prints a secret value (there are tests for that).
+Two read-only checks in Python, no telemetry: the machine check is stdlib only, and the repo check needs PyYAML for workflows (the Action installs it). Neither ever prints a secret value (there are tests for that).
 
 | check | runs on | answers |
 |---|---|---|
