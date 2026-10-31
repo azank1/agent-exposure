@@ -62,7 +62,7 @@ Supabase no longer exposes a new table to the API until it is granted, and its `
 
 ## Fix what it finds
 
-Every rule has its safe setting, with examples, in [`docs/fixes.md`](docs/fixes.md). Rather have it done? I fix a repository's findings in one fixed-price pull request ($490, within two working days). I also review agent and CI exposure for teams and set up Claude Code with guardrails that fail closed: [what that covers](https://azank1.github.io/offer-site/).
+Every rule has its safe setting, with examples, in [`docs/fixes.md`](docs/fixes.md). Rather have it done? I fix a repository's findings in one fixed-price pull request ($490, within two working days), or keep up to 10 repositories watched with a weekly run, a manual review and fix PRs for anything new (agent-check Watch, $490 a month). I also review agent and CI exposure for teams and set up Claude Code with guardrails that fail closed: [what that covers](https://azank1.github.io/offer-site/).
 
 ## agent-exposure: what one developer machine exposes
 
