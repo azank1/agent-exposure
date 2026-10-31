@@ -476,14 +476,24 @@ def found(out, level, where, rule, message):
     out.append({"level": level, "file": where[0], "line": where[1], "rule": rule, "message": message})
 
 
+def supabase_schemas(path):
+    """The schemas config.toml exposes to the API. Without tomllib (Python < 3.11) the [api] schemas line is read directly."""
+    if (config := load_toml(path)) is not None:
+        return (config.get("api") or {}).get("schemas")
+    try:
+        api = re.search(r"^\[api\][^\[]*?^\s*schemas\s*=\s*\[([^\]]*)\]", path.read_text(encoding="utf-8"), re.M | re.S)
+    except OSError:
+        return None
+    return re.findall(r"""["']([^"']+)["']""", api.group(1)) if api else None
+
+
 def check_supabase(root, out):
     for dirpath, dirnames, _ in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules")]
         if os.path.basename(dirpath) == "supabase" and {"migrations", "schemas"} & set(dirnames):
             base = Path(dirpath)
-            api = (load_toml(base / "config.toml") or {}).get("api") or {}
             files = sorted((base / "migrations").glob("*.sql")) + sorted((base / "schemas").glob("*.sql"))
-            check_migrations(root, out, files, set(api.get("schemas") or ["public"]))
+            check_migrations(root, out, files, set(supabase_schemas(base / "config.toml") or ["public"]))
 
 
 def check_migrations(root, out, files, exposed):
