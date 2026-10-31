@@ -26,6 +26,9 @@ except ImportError:  # workflow checks need PyYAML; config checks do not
     yaml = None
 
 LEVELS = ["low", "medium", "high", "critical"]
+MARKS = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "⚪"}
+FIX_GUIDE = "https://github.com/azank1/agent-exposure/blob/main/docs/fixes.md"
+FIX_FOR_YOU = "https://azank1.github.io/offer-site/"
 UNTRUSTED_EVENTS = {"issues", "issue_comment", "pull_request_target", "pull_request_review",
                     "pull_request_review_comment", "discussion", "discussion_comment"}
 UNTRUSTED_TEXT = re.compile(
@@ -619,11 +622,13 @@ def report(name, findings):
     lines += [f"**{len(findings)} finding{'s' if len(findings) != 1 else ''}: {summary}.**", "", "| level | where | finding |", "|---|---|---|"]
     for f in findings:
         where = f["file"] + (f":{f['line']}" if f["line"] else "")
-        lines.append(f"| {f['level']} | `{where}` | {f['message']} |")
+        lines.append(f"| {MARKS[f['level']]} {f['level']} | `{where}` | {f['message']} |")
     lines += ["", "## How to fix", ""]
     for rule in dict.fromkeys(f["rule"] for f in findings):
         if rule in FIXES:
             lines.append(f"- **{rule}**: {FIXES[rule]}")
+    lines += ["", f"The safe setting for each rule, with examples: [docs/fixes.md]({FIX_GUIDE}). "
+                  f"Rather have them fixed? [One fixed-price pull request]({FIX_FOR_YOU})."]
     return "\n".join(lines) + "\n"
 
 
