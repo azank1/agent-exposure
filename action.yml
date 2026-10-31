@@ -1,0 +1,31 @@
+name: agent-check
+description: Flag risky AI-agent setup committed to a repo, and agent workflows that outside issue or PR text can drive.
+author: azank1
+branding:
+  icon: shield
+  color: blue
+inputs:
+  path:
+    description: Repository directory to check.
+    required: false
+    default: "."
+  fail-on:
+    description: "Lowest level that fails the job: low, medium, high, critical, or none."
+    required: false
+    default: high
+runs:
+  using: composite
+  steps:
+    - name: Install PyYAML in an isolated venv
+      shell: bash
+      run: |
+        python3 -m venv "$RUNNER_TEMP/agent-check-venv"
+        "$RUNNER_TEMP/agent-check-venv/bin/pip" install --disable-pip-version-check --quiet "pyyaml==6.0.2"
+    - name: Check agent setup
+      shell: bash
+      env:
+        AGENT_CHECK_PATH: ${{ inputs.path }}
+        AGENT_CHECK_FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        "$RUNNER_TEMP/agent-check-venv/bin/python" "$GITHUB_ACTION_PATH/repo_check.py" "$AGENT_CHECK_PATH" \
+          --github --fail-on "$AGENT_CHECK_FAIL_ON"

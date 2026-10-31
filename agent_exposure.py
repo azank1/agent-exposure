@@ -14,8 +14,12 @@ import json
 import os
 import re
 import sys
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11: Codex TOML configs are skipped
+    tomllib = None
 
 SECRET_NAME = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|AUTH|CREDENTIAL)", re.I)
 PINNED_NPX = re.compile(r"@\d[\w.\-]*$|@[\^~]?\d")
@@ -29,6 +33,8 @@ def load_json(path):
 
 
 def load_toml(path):
+    if tomllib is None:
+        return None
     try:
         return tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):

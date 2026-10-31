@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""agent-check: risky AI-agent setup committed to a repository.
+
+Read-only. Checks the agent configuration a repository ships to everyone who
+clones it (Claude Code settings, MCP server configs for Claude Code, Cursor,
+VS Code, Gemini CLI and Codex) and the GitHub Actions workflows that run AI
+agents or handle text from issues and pull requests. Secret values are never
+printed.
+
+Usage: python3 repo_check.py [REPO_DIR] [--json] [--github] [--fail-on LEVEL]
+Exits 1 when a finding at or above --fail-on (default: high) is present.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+from agent_exposure import PINNED_NPX, SECRET_NAME, load_json, load_toml
+
+try:
+    import yaml
+except ImportError:  # workflow checks need PyYAML; config checks do not
+    yaml = None
+
+LEVELS = ["low", "medium", "high", "critical"]
+UNTRUSTED_EVENTS = {"issues", "issue_comment", "pull_request_target", "pull_request_review",
+                    "pull_request_review_comment", "discussion", "discussion_comment"}
+UNTRUSTED_TEXT = re.compile(
+    r"\$\{\{\s*github\.(?:event\.(?:issue\.(?:title|body)|comment\.body|review\.body|review_comment\.body"
+    r"|pull_request\.(?:title|body|head\.ref|head\.label)|discussion\.(?:title|body)|head_commit\.message)"
+    r"|head_ref)\b")
+PR_HEAD_REF = re.compile(r"github\.(?:event\.pull_request\.head\.(?:sha|ref)|head_ref)|refs/pull/")
+AGENT_ACTIONS = {
+    "anthropics/claude-code-action": "Claude Code",
+    "anthropics/claude-code-base-action": "Claude Code",
+    "openai/codex-action": "Codex",
+    "google-github-actions/run-gemini-cli": "Gemini CLI",
+}
+MCP_FILES = [(".mcp.json", "mcpServers"), (".cursor/mcp.json", "mcpServers"), (".vscode/mcp.json", "servers"),
+             (".gemini/settings.json", "mcpServers")]
+PLACEHOLDER = re.compile(r"your|xxx|<|>|changeme|example|placeholder|replace|redacted|\.\.\.|^\*+$|todo", re.I)
+BROAD_BASH = re.compile(r"(?<![\w(])Bash(?:\(\*(?::\*)?\))?(?![\w(])")
+
+FIXES = {
+    "bypass-permissions": "Remove defaultMode bypassPermissions from committed settings; keep it, if at all, in an uncommitted local file.",
+    "broad-shell-allow": "Replace the wildcard with the few commands the team runs (for example Bash(npm test)) and add hooks that block destructive commands.",
+    "dangerous-prompt-skipped": "Remove skipDangerousModePermissionPrompt from committed settings.",
+    "all-project-mcp-enabled": "Set enableAllProjectMcpServers to false so each new server in .mcp.json needs a person to approve it.",
+    "local-settings-committed": "Remove .claude/settings.local.json from git and add it to .gitignore.",
+    "plaintext-secret": "Rotate the credential now, then reference an environment variable instead (${VAR}).",
+    "unpinned-mcp-package": "Pin an exact version (package@1.2.3) and review upgrades like any other dependency.",
+    "no-codeowners": "Add CODEOWNERS entries for .claude/, .mcp.json and .github/workflows/ so changes need an owner's review.",
+    "pwn-request": "Never check out pull request code in a pull_request_target job; split it into an unprivileged pull_request build.",
+    "shell-injection": "Pass the value through env: and quote it in the script instead of using ${{ }} inside run:.",
+    "agent-open-to-anyone": "Restrict who can trigger the agent: remove '*' and list specific trusted users, or drop the input.",
+    "agent-unrestricted": "Remove the flag; give the agent a narrow tool list and a sandbox instead.",
+    "untrusted-text-in-prompt": "Do not paste issue or PR text into the prompt; let the agent read it as data with read-only permissions.",
+    "agent-write-on-untrusted": "Give the agent job read-only permissions, and do any writes in a separate job after review.",
+    "agent-default-token": "Add an explicit permissions: block with the least the job needs.",
+}
+
+
+def add(out, level, path, root, rule, message, needle=None):
+    rel = os.path.relpath(path, root)
+    out.append({"level": level, "file": rel, "line": line_of(path, needle) if needle else None, "rule": rule, "message": message})
+
+
+def line_of(path, needle):
+    try:
+        for i, line in enumerate(Path(path).read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+            if needle in line:
+                return i
+    except OSError:
+        pass
+    return None
+
+
+def literal_secret(value):
+    v = str(value).strip()
+    return len(v) >= 12 and "$" not in v and not PLACEHOLDER.search(v)
+
+
+def check_claude_settings(root, out):
+    for rel in (".claude/settings.json", ".claude/settings.local.json"):
+        p = root / rel
+        data = load_json(p)
+        if not isinstance(data, dict):
+            continue
+        if rel.endswith("local.json"):
+            add(out, "low", p, root, "local-settings-committed", "personal Claude Code settings are committed and apply to every clone")
+        perms = data.get("permissions") or {}
+        if perms.get("defaultMode") == "bypassPermissions":
+            add(out, "critical", p, root, "bypass-permissions", "defaultMode is bypassPermissions: every clone runs the agent with no approval prompts", "bypassPermissions")
+        for rule in perms.get("allow") or []:
+            if isinstance(rule, str) and (rule in ("Bash", "Bash(*)", "Bash(*:*)") or rule.startswith("Bash(sudo")):
+                add(out, "high", p, root, "broad-shell-allow", f"allow rule {rule} pre-approves shell commands for everyone who clones the repo", rule)
+        if data.get("skipDangerousModePermissionPrompt"):
+            add(out, "high", p, root, "dangerous-prompt-skipped", "the dangerous-mode warning is switched off for every clone", "skipDangerousModePermissionPrompt")
+        if data.get("enableAllProjectMcpServers") is True:
+            add(out, "high", p, root, "all-project-mcp-enabled", "any MCP server added to .mcp.json, for example in a pull request, starts on developers' machines without a prompt", "enableAllProjectMcpServers")
+        for k, v in (data.get("env") or {}).items():
+            if SECRET_NAME.search(k) and literal_secret(v):
+                add(out, "high", p, root, "plaintext-secret", f"env {k} holds a literal credential in a committed file", k)
+
+
+def check_mcp_servers(root, out):
+    files = [(rel, key, load_json(root / rel)) for rel, key in MCP_FILES]
+    codex = load_toml(root / ".codex/config.toml")
+    files.append((".codex/config.toml", "mcp_servers", codex))
+    for rel, key, data in files:
+        if not isinstance(data, dict):
+            continue
+        p = root / rel
+        for name, spec in (data.get(key) or {}).items():
+            if not isinstance(spec, dict):
+                continue
+            cmd = os.path.basename(str(spec.get("command", "")))
+            pkgs = [str(a) for a in spec.get("args", []) if not str(a).startswith("-")]
+            if cmd in ("npx", "bunx", "pnpx") and pkgs and not PINNED_NPX.search(pkgs[0]):
+                add(out, "medium", p, root, "unpinned-mcp-package", f"MCP server {name} runs the latest release of {pkgs[0]} on every start", pkgs[0])
+            if cmd == "uvx" and pkgs and "==" not in pkgs[0] and "@" not in pkgs[0]:
+                add(out, "medium", p, root, "unpinned-mcp-package", f"MCP server {name} runs the latest release of {pkgs[0]} on every start", pkgs[0])
+            for field in ("env", "headers"):
+                for k, v in (spec.get(field) or {}).items():
+                    if (SECRET_NAME.search(k) or k.lower() == "authorization") and literal_secret(v):
+                        add(out, "high", p, root, "plaintext-secret", f"MCP server {name}: {field} {k} holds a literal credential in a committed file", k)
+
+
+def check_codeowners(root, out):
+    agent_files = [rel for rel in (".claude", ".mcp.json", ".cursor/mcp.json", ".vscode/mcp.json", ".gemini") if (root / rel).exists()]
+    if not agent_files:
+        return
+    owners = ""
+    for rel in ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"):
+        try:
+            owners += (root / rel).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            pass
+    covered = lambda f: re.search(r"(^|\s)(\*\s|/?" + re.escape(f.split("/")[0]) + r")", owners, re.M)
+    missing = [f for f in agent_files if not covered(f)]
+    if missing:
+        add(out, "low", root / missing[0], root, "no-codeowners", "no CODEOWNERS rule covers " + ", ".join(missing) + ": agent config can change without an owner's review")
+
+
+def triggers(doc):
+    on = doc.get("on", doc.get(True))  # PyYAML reads a bare `on` key as True
+    if isinstance(on, str):
+        return {on}
+    if isinstance(on, list):
+        return {str(e) for e in on}
+    if isinstance(on, dict):
+        return {str(e) for e in on}
+    return set()
+
+
+def write_scopes(perms):
+    if perms is None:
+        return None
+    if isinstance(perms, str):
+        return ["write-all"] if perms == "write-all" else []
+    if isinstance(perms, dict):
+        return sorted(f"{k}: write" for k, v in perms.items() if v == "write" and k != "id-token")
+    return []
+
+
+def check_workflows(root, out):
+    wf_dir = root / ".github/workflows"
+    if not wf_dir.is_dir():
+        return
+    files = sorted(list(wf_dir.glob("*.yml")) + list(wf_dir.glob("*.yaml")))
+    if files and yaml is None:
+        out.append({"level": "low", "file": ".github/workflows", "line": None, "rule": "skipped",
+                    "message": "workflow checks skipped: PyYAML is not installed"})
+        return
+    for p in files:
+        try:
+            doc = yaml.safe_load(p.read_text(encoding="utf-8", errors="ignore"))
+        except yaml.YAMLError:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        events = triggers(doc)
+        untrusted = sorted(events & UNTRUSTED_EVENTS)
+        jobs = doc.get("jobs")
+        for job_id, job in (jobs.items() if isinstance(jobs, dict) else []):
+            if not isinstance(job, dict):
+                continue
+            perms = job.get("permissions", doc.get("permissions"))
+            steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
+            for step in steps:
+                uses = str(step.get("uses", ""))
+                run = str(step.get("run", ""))
+                with_ = step.get("with") if isinstance(step.get("with"), dict) else {}
+                if "pull_request_target" in events and uses.startswith("actions/checkout") and PR_HEAD_REF.search(str(with_.get("ref", ""))):
+                    add(out, "critical", p, root, "pwn-request", f"job {job_id} checks out pull request code under pull_request_target, where it runs with the base repo's secrets and token", str(with_.get("ref")))
+                m = UNTRUSTED_TEXT.search(run)
+                if m:
+                    add(out, "high", p, root, "shell-injection", f"job {job_id} pastes {m.group(0)} }}}} into a shell script: anyone who can set that text can run commands", m.group(0))
+                action = uses.split("@")[0]
+                agent = next((label for prefix, label in AGENT_ACTIONS.items() if action == prefix or action.startswith(prefix + "/")), None)
+                if agent:
+                    check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms)
+
+
+def check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms):
+    w = {k: str(v) for k, v in with_.items()}
+    where = f"job {job_id} ({agent})"
+    if untrusted:
+        where += " on " + ", ".join(untrusted)
+    for key in ("allowed_non_write_users", "allow-users"):
+        if w.get(key, "").strip() == "*":
+            add(out, "critical" if untrusted else "high", p, root, "agent-open-to-anyone", f"{where}: {key} '*' lets any GitHub user drive the agent", key)
+    if w.get("allowed_bots", "").strip() == "*":
+        add(out, "high", p, root, "agent-open-to-anyone", f"{where}: allowed_bots '*' lets any GitHub App drive the agent", "allowed_bots")
+    if w.get("safety-strategy") == "unsafe":
+        add(out, "high", p, root, "agent-unrestricted", f"{where}: safety-strategy unsafe gives the agent the runner's sudo and its secrets", "safety-strategy")
+    if w.get("sandbox") == "danger-full-access":
+        add(out, "high", p, root, "agent-unrestricted", f"{where}: sandbox danger-full-access turns the sandbox off", "danger-full-access")
+    args = " ".join(w.get(k, "") for k in ("claude_args", "codex-args", "settings"))
+    for flag in ("--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox", "--yolo", "bypassPermissions"):
+        if flag in args:
+            add(out, "high", p, root, "agent-unrestricted", f"{where}: {flag} removes every approval check", flag)
+    m = re.search(r"--allowed-?tools[ =]+[\"']?([^\"'\n]*)", args, re.I)
+    if m and BROAD_BASH.search(m.group(1)):
+        add(out, "high", p, root, "broad-shell-allow", f"{where}: the agent may run any shell command (--allowedTools includes unrestricted Bash)", "allowedTools")
+    t = UNTRUSTED_TEXT.search(w.get("prompt", ""))
+    if t:
+        add(out, "high" if untrusted else "medium", p, root, "untrusted-text-in-prompt", f"{where}: {t.group(0)} }}}} is pasted into the agent's prompt, so whoever writes that text can instruct the agent", t.group(0))
+    scopes = write_scopes(perms)
+    if scopes is None:
+        add(out, "low", p, root, "agent-default-token", f"{where}: no permissions block, so the token gets the repository default")
+    elif scopes and untrusted:
+        add(out, "medium", p, root, "agent-write-on-untrusted", f"{where}: the agent runs on events that carry outside text, with {', '.join(scopes)}", "permissions")
+
+
+def check(root):
+    root = Path(root)
+    out = []
+    check_claude_settings(root, out)
+    check_mcp_servers(root, out)
+    check_codeowners(root, out)
+    check_workflows(root, out)
+    out.sort(key=lambda f: (-LEVELS.index(f["level"]), f["file"], f["line"] or 0))
+    return out
+
+
+def report(name, findings):
+    counts = {lv: sum(f["level"] == lv for f in findings) for lv in LEVELS}
+    lines = [f"# agent-check: {name}", ""]
+    if not findings:
+        return "\n".join(lines + ["No risky agent setup found.", ""])
+    summary = ", ".join(f"{counts[lv]} {lv}" for lv in reversed(LEVELS) if counts[lv])
+    lines += [f"**{len(findings)} finding{'s' if len(findings) != 1 else ''}: {summary}.**", "", "| level | where | finding |", "|---|---|---|"]
+    for f in findings:
+        where = f["file"] + (f":{f['line']}" if f["line"] else "")
+        lines.append(f"| {f['level']} | `{where}` | {f['message']} |")
+    lines += ["", "## How to fix", ""]
+    for rule in dict.fromkeys(f["rule"] for f in findings):
+        if rule in FIXES:
+            lines.append(f"- **{rule}**: {FIXES[rule]}")
+    return "\n".join(lines) + "\n"
+
+
+def annotate(findings):
+    kind = {"critical": "error", "high": "error", "medium": "warning", "low": "notice"}
+    for f in findings:
+        loc = f"file={f['file']}" + (f",line={f['line']}" if f["line"] else "")
+        msg = f["message"].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::{kind[f['level']]} {loc},title=agent-check {f['level']}::{msg}")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("repo", nargs="?", default=".")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--github", action="store_true", help="emit GitHub annotations and a job summary")
+    ap.add_argument("--fail-on", default="high", choices=LEVELS + ["none"])
+    a = ap.parse_args(argv)
+    root = Path(a.repo).resolve()
+    findings = check(root)
+    if a.json:
+        json.dump(findings, sys.stdout, indent=1)
+        print()
+    else:
+        text = report(root.name, findings)
+        sys.stdout.write(text)
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if a.github and summary:
+            with open(summary, "a", encoding="utf-8") as f:
+                f.write(text)
+    if a.github:
+        annotate(findings)
+    if a.fail_on != "none" and any(LEVELS.index(f["level"]) >= LEVELS.index(a.fail_on) for f in findings):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

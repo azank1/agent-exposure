@@ -1,18 +1,68 @@
 # agent-exposure
 
-What can the AI coding agents on this machine reach?
+What can your AI coding agents reach, and who can tell them what to do?
 
-A read-only check for one user and, optionally, one project:
+Two read-only checks, stdlib Python, no telemetry. Neither ever prints a secret value (there are tests for that).
+
+| check | runs on | answers |
+|---|---|---|
+| `agent_exposure.py` | one developer machine | which agents and MCP servers are configured, and which credential and wallet stores an agent with shell access could read |
+| `repo_check.py` (agent-check) | a repository, locally or as a GitHub Action | what risky agent setup the repo ships to everyone who clones it, and which CI agents outside issue or PR text can drive |
+
+## agent-check: in CI
+
+```yaml
+# .github/workflows/agent-check.yml
+on: [pull_request]
+permissions:
+  contents: read
+jobs:
+  agent-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azank1/agent-exposure@v1
+        with:
+          fail-on: high   # low | medium | high | critical | none
+```
+
+Findings appear as annotations on the pull request and as a table in the job summary. Locally:
+
+```
+python3 repo_check.py ~/my-repo            # markdown report, exit 1 on high or critical
+python3 repo_check.py ~/my-repo --json
+```
+
+What it flags:
+
+- **committed Claude Code settings** that apply to every clone: `bypassPermissions`, `Bash(*)`-style allow rules, the dangerous-mode prompt switched off, `enableAllProjectMcpServers` (any server added to `.mcp.json` in a pull request starts without a prompt), a committed `settings.local.json`;
+- **MCP configs** (`.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`, `.gemini/settings.json`, `.codex/config.toml`): unpinned `npx`/`uvx` packages, and credentials written into the file instead of referenced as `${VAR}`;
+- **agent workflows** (`anthropics/claude-code-action`, `openai/codex-action`, `google-github-actions/run-gemini-cli`): anyone allowed to trigger the agent (`'*'`), sandbox or approval checks turned off, unrestricted shell tools, issue or PR text pasted into the prompt, write permissions on events that carry outside text, no `permissions:` block;
+- **the two classic workflow holes** on the same channel: checking out pull request code under `pull_request_target`, and `${{ github.event.issue.title }}`-style text inside `run:`.
+
+For full GitHub Actions linting, run [zizmor](https://github.com/zizmorcore/zizmor) too; agent-check covers the agent layer.
+
+## agent-exposure: on a developer machine
 
 - **agents and configs:** Claude Code (user and project settings, plugins), MCP servers (`~/.claude.json`, `.mcp.json`, Cursor, Windsurf, Gemini CLI, Codex), Continue, Aider;
 - **risky settings:** `bypassPermissions`, broad shell allow rules, Codex `danger-full-access` / `approval_policy = never`, settings files with no hooks;
 - **MCP servers** started from an unpinned package (every start runs the latest release), or with secret-named env vars or credential headers in plain config;
 - **credential and wallet stores** an agent running shell commands as this user can read: cloud CLIs, GitHub/npm/PyPI tokens, SSH keys, Solana/Ethereum/Foundry/Bitcoin wallets, browser profiles, `.env` files.
 
-It reports presence only. Secret values are never printed or stored (there is a test for that).
+It reports presence only. Nothing leaves the machine.
 
 ```
 python3 agent_exposure.py --project ~/my-repo          # markdown report
 python3 agent_exposure.py --project ~/my-repo --json   # machine-readable
-python3 test_agent_exposure.py                         # tests (stdlib only, Python 3.11+)
 ```
+
+## Tests
+
+```
+python3 test_agent_exposure.py    # Python 3.11+
+python3 test_repo_check.py        # Python 3.10+, needs PyYAML for the workflow checks
+```
+
+## Help with the findings
+
+I review agent and CI exposure for teams and set up Claude Code with guardrails that fail closed: [what that covers](https://azank1.github.io/offer-site/). MIT licensed.
