@@ -42,7 +42,7 @@ python3 repo_check.py ~/my-repo --json
 | Workflows | pull request code checked out in a job that holds the base repository's token, `${{ }}` text pasted into `run:` | critical |
 | Supabase migrations | tables with row-level security off, policies that never check whose row it is, default grants to `anon`, views without `security_invoker` | critical |
 
-Severity follows what an outsider could actually do: pull request code that is checked out but never run, or a job limited to trusted authors, grades lower. A workflow that does not parse is reported, not skipped. For full GitHub Actions linting, run [zizmor](https://github.com/zizmorcore/zizmor) too; agent-check covers the agent layer.
+Severity follows what an outsider could actually do: pull request code that is checked out but never run, or a job limited to trusted authors, grades lower. A workflow that does not parse is reported, not skipped. For full GitHub Actions linting, run [zizmor](https://github.com/zizmorcore/zizmor) too; agent-check covers the agent layer. On Supabase, the dashboard's Security Advisor (`supabase db advisors` on the CLI) checks a project's database for several of the same mistakes; agent-check reads the migrations in the pull request, before they reach a database, and also flags write policies that only check that the user is signed in.
 
 <details>
 <summary>Every rule in detail</summary>
