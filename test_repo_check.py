@@ -466,6 +466,101 @@ class TokenWithheld(unittest.TestCase):
         self.assertEqual(self.findings(wf), [("agent-write-on-untrusted", "low")])
 
 
+class SupabaseMigrations(unittest.TestCase):
+    def findings(self, *migrations, config=None):
+        with tempfile.TemporaryDirectory() as d:
+            for i, sql in enumerate(migrations):
+                write(Path(d) / f"supabase/migrations/2026100{i}000000_m{i}.sql", sql)
+            if config:
+                write(Path(d) / "supabase/config.toml", config)
+            found = json.loads(run(d, "--json", "--fail-on", "none").stdout)
+            return [(x["rule"], x["level"], x["message"], x["line"]) for x in found]
+
+    def test_rls_off_table_granted_to_anon_is_critical(self):
+        f = self.findings("create table public.notes (id uuid primary key, body text);\n"
+                          "grant select, insert, update, delete on table public.notes to anon, authenticated;\n")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "critical")])
+        self.assertIn("read and change every row", f[0][2])
+
+    def test_rls_off_table_without_grants_is_high(self):
+        f = self.findings("-- profiles\n\ncreate table profiles (id uuid primary key, email text);\n")
+        self.assertEqual([(r, lv, line) for r, lv, _, line in f], [("rls-off-table", "high", 3)])
+        self.assertIn("30 Oct 2026", f[0][2])
+
+    def test_authenticated_only_grant_is_high(self):
+        f = self.findings("create table public.posts (id int);\ngrant select on public.posts to authenticated;\n")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "high")])
+        self.assertIn("any signed-in user can read every row", f[0][2])
+
+    def test_rls_enabled_in_a_later_migration(self):
+        self.assertEqual(self.findings('create table "public"."Orders" (id int);',
+                                       'alter table if exists only "public"."Orders" enable row level security;'), [])
+
+    def test_do_block_enabling_rls_on_every_table(self):
+        self.assertEqual(self.findings("""create table a (id int);
+create table b (id int);
+do $$ declare r record; begin
+  for r in select tablename from pg_tables where schemaname = 'public' loop
+    execute format('alter table public.%I enable row level security', r.tablename);
+  end loop;
+end $$;"""), [])
+
+    def test_event_trigger_enabling_rls_on_new_tables(self):
+        self.assertEqual(self.findings("""create or replace function rls_auto_enable() returns event_trigger language plpgsql as $fn$
+declare cmd record;
+begin
+  for cmd in select * from pg_event_trigger_ddl_commands() where command_tag = 'CREATE TABLE' loop
+    execute format('alter table %s enable row level security', cmd.object_identity);
+  end loop;
+end $fn$;
+create event trigger ensure_rls on ddl_command_end when tag in ('CREATE TABLE') execute function rls_auto_enable();
+create table public.auto (id int);"""), [])
+
+    def test_grant_on_all_tables_reaches_existing_tables(self):
+        f = self.findings("create table public.items (id int);", "grant all on all tables in schema public to anon;")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "critical")])
+
+    def test_default_privileges_to_anon(self):
+        f = self.findings("alter default privileges for role postgres in schema public grant all on tables to anon, authenticated, service_role;\n"
+                          "create table public.later (id int);\n"
+                          "create table public.safe (id int);\nalter table public.safe enable row level security;\n")
+        self.assertEqual(sorted((r, lv) for r, lv, _, _ in f), [("default-grant-to-anon", "high"), ("rls-off-table", "critical")])
+        self.assertIn("public.later", [m for r, _, m, _ in f if r == "rls-off-table"][0])
+
+    def test_views_without_security_invoker(self):
+        f = self.findings("create view public.open_view as select 1;\n"
+                          "create view public.safe_view with (security_invoker = true) as select 1;\n"
+                          "create or replace view public.later_fixed as select 1;\n"
+                          "alter view public.later_fixed set (security_invoker = on);\n")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("view-bypasses-rls", "high")])
+        self.assertIn("public.open_view", f[0][2])
+
+    def test_schema_exposed_only_through_config(self):
+        sql = "create schema private;\ncreate table private.secrets (id int);\n"
+        self.assertEqual(self.findings(sql), [])
+        f = self.findings(sql, config='[api]\nschemas = ["public", "private"]\n')
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "high")])
+
+    def test_comments_strings_drops_temp_tables_and_renames(self):
+        self.assertEqual(self.findings("""-- create table public.commented (id int);
+/* create table public.block (id int); */
+create table public.gone (id int);
+drop table if exists public.gone cascade;
+create temp table scratch (id int);
+create table public.old_name (id int);
+alter table public.old_name rename to new_name;
+alter table public.new_name enable row level security;
+insert into notes values ('create table public.instring (id int);');"""), [])
+
+    def test_revoked_from_api_roles(self):
+        self.assertEqual(self.findings("create table public.internal (id int);\n"
+                                       "revoke all on table public.internal from anon, authenticated;\n"), [])
+
+    def test_rls_disabled_again(self):
+        f = self.findings("create table t (id int);\nalter table t enable row level security;\n", "alter table t disable row level security;")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "high")])
+
+
 class CleanRepo(unittest.TestCase):
     def test_no_findings(self):
         with tempfile.TemporaryDirectory() as d:

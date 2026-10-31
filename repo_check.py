@@ -3,9 +3,10 @@
 
 Read-only. Checks the agent configuration a repository ships to everyone who
 clones it (Claude Code settings, MCP server configs for Claude Code, Cursor,
-VS Code, Gemini CLI and Codex) and the GitHub Actions workflows that run AI
-agents or handle text from issues and pull requests. Secret values are never
-printed.
+VS Code, Gemini CLI and Codex), the GitHub Actions workflows that run AI
+agents or handle text from issues and pull requests, and the Supabase
+migrations that AI app builders write: tables and views the API can reach
+without row-level security. Secret values are never printed.
 
 Usage: python3 repo_check.py [REPO_DIR] [--json] [--github] [--fail-on LEVEL]
 Exits 1 when a finding at or above --fail-on (default: high) is present.
@@ -53,6 +54,23 @@ MCP_FILES = [(".mcp.json", "mcpServers"), (".cursor/mcp.json", "mcpServers"), ("
 PLACEHOLDER = re.compile(r"your|xxx|<|>|changeme|example|placeholder|replace|redacted|\.\.\.|^\*+$|todo", re.I)
 BROAD_BASH = re.compile(r"(?<![\w(])Bash(?:\(\*(?::\*)?\))?(?![\w(])")
 
+# Supabase migrations. Until 30 Oct 2026 Supabase granted every new public table to the anon and authenticated
+# roles, so row-level security was the only thing between the app's public key and the data; since then a new
+# table needs an explicit grant, and the quick fix for "permission denied" is often a grant to everyone.
+SQL_IDENT = r'(?:"[^"]+"|[A-Za-z_][\w$]*)'
+SQL_QNAME = rf"(?:({SQL_IDENT})\s*\.\s*)?({SQL_IDENT})"
+CREATE_TABLE = re.compile(rf"create\s+(?:(?:global|local)\s+)?(temp\s+|temporary\s+)?(?:unlogged\s+)?table\s+(if\s+not\s+exists\s+)?{SQL_QNAME}", re.I)
+CREATE_VIEW = re.compile(rf"create\s+(?:or\s+replace\s+)?(temp\s+|temporary\s+)?(?:recursive\s+)?view\s+{SQL_QNAME}(.*?)\bas\b", re.I | re.S)
+ALTER_RELATION = re.compile(rf"alter\s+(table|view)\s+(?:if\s+exists\s+)?(?:only\s+)?{SQL_QNAME}(.*)", re.I | re.S)
+DROP_RELATION = re.compile(r"drop\s+(?:table|view)\s+(?:if\s+exists\s+)?(.+)", re.I | re.S)
+GRANT = re.compile(r"(grant|revoke)\s+(?:grant\s+option\s+for\s+)?(.+?)\s+on\s+(.+?)\s+(?:to|from)\s+(.+)", re.I | re.S)
+DEFAULT_GRANT = re.compile(r"alter\s+default\s+privileges\b(.*?)\bgrant\s+(.+?)\s+on\s+tables\s+to\s+(.+)", re.I | re.S)
+NOT_A_RELATION = re.compile(r"(?:all\s+)?(?:sequences?|functions?|procedures?|routines?|schema|database|type|domain|language|large\s+object|tablespace|foreign)\b", re.I)
+SECURITY_INVOKER = re.compile(r"security_invoker\s*(?:=\s*(?:true|on|1|yes)\b|(?=[,)]))", re.I)
+ENABLE_RLS = re.compile(r"enable\s+row\s+level\s+security", re.I)
+EVERY_TABLE = re.compile(r"\bpg_tables\b|information_schema\.tables|\bpg_class\b", re.I)
+DML = ("select", "insert", "update", "delete")
+
 FIXES = {
     "bypass-permissions": "Remove defaultMode bypassPermissions from committed settings; keep it, if at all, in an uncommitted local file.",
     "broad-shell-allow": "Replace the wildcard with the few commands the team runs (for example Bash(npm test)) and add hooks that block destructive commands.",
@@ -70,6 +88,9 @@ FIXES = {
     "agent-write-on-untrusted": "Give the agent job read-only permissions, and do any writes in a separate job after review.",
     "agent-default-token": "Add an explicit permissions: block with the least the job needs.",
     "cli-agent-on-untrusted": "Run the agent CLI read-only with approvals on, pass outside text as a file it reads as data, and post results from a separate step that holds the token.",
+    "rls-off-table": "Enable row-level security on the table and add a policy for each role, then grant each role only the actions the app uses. Never fix 'permission denied' by granting everything to anon.",
+    "default-grant-to-anon": "Remove the default-privileges grant and grant each new table explicitly, after enabling row-level security on it.",
+    "view-bypasses-rls": "Create the view with (security_invoker = true) so it applies the row-level security of the tables it reads, or revoke it from anon and authenticated.",
 }
 
 
@@ -372,6 +393,188 @@ def check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms, step_
             add(out, "medium", p, root, "agent-write-on-untrusted", f"{where}: the agent reads text from outside contributors, with {', '.join(scopes)}", "permissions")
 
 
+def sql_code(text):
+    """The SQL with comments, string literals and dollar-quoted bodies blanked out (newlines kept, so offsets still
+    match the file), plus each dollar-quoted body with its offset."""
+    code, bodies, i, n = list(text), [], 0, len(text)
+    while i < n:
+        if text.startswith("--", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+        elif text[i] == "'":
+            j = i + 1
+            while j < n and (text[j] != "'" or text.startswith("''", j)):
+                j += 2 if text.startswith("''", j) else 1
+            j = min(j + 1, n)
+        elif text[i] == '"':  # quoted identifiers stay
+            j = text.find('"', i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        elif m := re.match(r"\$(?:[A-Za-z_]\w*)?\$", text[i:i + 64]):
+            j = text.find(m.group(0), i + len(m.group(0)))
+            j = n if j < 0 else j + len(m.group(0))
+            bodies.append((i, text[i:j]))
+        else:
+            i += 1
+            continue
+        for k in range(i, j):
+            if code[k] != "\n":
+                code[k] = " "
+        i = j
+    return "".join(code), bodies
+
+
+def sql_qualify(schema, name):
+    ident = lambda t: t[1:-1] if t.startswith('"') else t.lower()
+    return (ident(schema) if schema else "public", ident(name))
+
+
+def sql_names(text):
+    """Qualified names from a list such as 'table a, public."B" cascade'."""
+    return [sql_qualify(m.group(1), m.group(2)) for part in text.split(",")
+            if (m := re.match(rf"\s*(?:table\s+)?{SQL_QNAME}", part, re.I))]
+
+
+def sql_privileges(text):
+    text = text.lower()
+    return set(DML) if re.search(r"\ball\b", text) else {p for p in DML if re.search(rf"\b{p}\b", text)}
+
+
+def sql_roles(text):
+    text = re.split(r"\bwith\s+grant\s+option\b|\bgranted\s+by\b|\bcascade\b|\brestrict\b", text, flags=re.I)[0]
+    return {r.strip().strip('"').lower() for r in text.split(",") if r.strip()}
+
+
+def found(out, level, where, rule, message):
+    out.append({"level": level, "file": where[0], "line": where[1], "rule": rule, "message": message})
+
+
+def check_supabase(root, out):
+    for dirpath, dirnames, _ in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules")]
+        if os.path.basename(dirpath) == "supabase" and {"migrations", "schemas"} & set(dirnames):
+            base = Path(dirpath)
+            api = (load_toml(base / "config.toml") or {}).get("api") or {}
+            files = sorted((base / "migrations").glob("*.sql")) + sorted((base / "schemas").glob("*.sql"))
+            check_migrations(root, out, files, set(api.get("schemas") or ["public"]))
+
+
+def check_migrations(root, out, files, exposed):
+    """Replay the migrations in order, tracking row-level security, grants and renames, then report what the API can reach."""
+    rels, defaults, auto_rls = {}, {}, False  # defaults: schema (None = every schema) -> role -> privileges
+
+    def initial_grants(schema):
+        grants = {}
+        for scope in (None, schema):
+            for role, privs in defaults.get(scope, {}).items():
+                grants.setdefault(role, set()).update(privs)
+        return grants
+
+    for p in files:
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        code, bodies = sql_code(text)
+        for m in re.finditer(r"[^;]+", code):
+            stmt = m.group(0).lstrip()
+            if not stmt:
+                continue
+            at = m.end() - len(stmt)
+            where = (os.path.relpath(p, root), text.count("\n", 0, at) + 1)
+            inside = [b for o, b in bodies if m.start() <= o < m.end()]
+            if any(ENABLE_RLS.search(b) and "pg_event_trigger_ddl_commands" in b for b in inside):
+                auto_rls = True  # an event-trigger function that switches RLS on for each new table
+            if re.match(r"do\b", stmt, re.I):
+                if any(ENABLE_RLS.search(b) and EVERY_TABLE.search(b) for b in inside):
+                    for r in rels.values():  # a loop that switches RLS on for every existing table
+                        r["rls"] = r["rls"] or r["kind"] == "table"
+            elif c := CREATE_TABLE.match(stmt):
+                key = sql_qualify(c.group(3), c.group(4))
+                if not c.group(1) and not (c.group(2) and key in rels):
+                    rels[key] = {"kind": "table", "rls": auto_rls, "invoker": False, "where": where,
+                                 "grants": initial_grants(key[0]), "revoked": set()}
+            elif c := CREATE_VIEW.match(stmt):
+                key = sql_qualify(c.group(2), c.group(3))
+                old = rels.get(key)
+                if not c.group(1):
+                    keep = old is not None and old["invoker"] and "with" not in c.group(4).lower()
+                    rels[key] = {"kind": "view", "rls": False, "invoker": bool(SECURITY_INVOKER.search(c.group(4))) or keep,
+                                 "where": where, "grants": old["grants"] if old else initial_grants(key[0]),
+                                 "revoked": old["revoked"] if old else set()}
+            elif c := ALTER_RELATION.match(stmt):
+                key, rest = sql_qualify(c.group(2), c.group(3)), c.group(4)
+                r = rels.get(key)
+                if r is None:
+                    continue
+                if rn := re.search(rf"\brename\s+to\s+({SQL_IDENT})", rest, re.I):
+                    rels[sql_qualify(f'"{key[0]}"', rn.group(1))] = rels.pop(key)
+                if re.search(r"\bdisable\s+row\s+level\s+security", rest, re.I):
+                    r["rls"] = False
+                if ENABLE_RLS.search(rest):
+                    r["rls"] = True
+                if re.search(r"security_invoker\s*=\s*(?:false|off|0|no)\b", rest, re.I):
+                    r["invoker"] = False
+                elif re.search(r"\bset\s*\(", rest, re.I) and SECURITY_INVOKER.search(rest):
+                    r["invoker"] = True
+            elif c := DROP_RELATION.match(stmt):
+                for key in sql_names(c.group(1)):
+                    rels.pop(key, None)
+            elif c := DEFAULT_GRANT.match(stmt):
+                privs, roles = sql_privileges(c.group(2)), sql_roles(c.group(3))
+                s = re.search(r"\bin\s+schema\s+(.+?)\s*$", c.group(1), re.I | re.S)
+                schemas = [sql_qualify(None, x.strip())[1] for x in s.group(1).split(",")] if s else [None]
+                for schema in schemas:
+                    for role in roles:
+                        defaults.setdefault(schema, {}).setdefault(role, set()).update(privs)
+                api_roles = roles & {"anon", "public", "authenticated"}
+                if privs and api_roles and (schemas == [None] or set(schemas) & exposed):
+                    found(out, "high" if roles & {"anon", "public"} else "medium", where, "default-grant-to-anon",
+                          f"default privileges grant {', '.join(sorted(privs))} on every new table to {', '.join(sorted(api_roles))}: "
+                          "that undoes Supabase's 30 Oct 2026 change, so each table created without row-level security is open to them")
+            elif c := GRANT.match(stmt):
+                verb, privs, target, roles = c.group(1).lower(), sql_privileges(c.group(2)), c.group(3).strip(), sql_roles(c.group(4))
+                if s := re.match(r"all\s+tables\s+in\s+schema\s+(.+)", target, re.I | re.S):
+                    schemas = {sql_qualify(None, x.strip())[1] for x in s.group(1).split(",")}
+                    keys = [k for k in rels if k[0] in schemas]
+                elif NOT_A_RELATION.match(target):
+                    continue
+                else:
+                    keys = [k for k in sql_names(target) if k in rels]
+                for k in keys:
+                    for role in roles:
+                        held = rels[k]["grants"].setdefault(role, set())
+                        if verb == "grant":
+                            held |= privs
+                            rels[k]["revoked"].discard(role)
+                        else:
+                            held -= privs
+                            if privs == set(DML):
+                                rels[k]["revoked"].add(role)
+
+    for (schema, name), r in rels.items():
+        anon = r["grants"].get("anon", set()) | r["grants"].get("public", set())
+        signed_in = r["grants"].get("authenticated", set())
+        if schema not in exposed or ({"anon", "authenticated"} <= r["revoked"] and not anon and not signed_in):
+            continue
+        label = f"{schema}.{name}"
+        if r["kind"] == "table" and not r["rls"]:
+            if anon or signed_in:
+                privs = anon or signed_in
+                can = " and ".join(word for word, ok in (("read", "select" in privs), ("change", privs - {"select"})) if ok)
+                who = "anyone with the app's public key" if anon else "any signed-in user"
+                found(out, "critical" if anon else "high", r["where"], "rls-off-table",
+                      f"table {label} has row-level security off and is granted to {'anon' if anon else 'authenticated'}: {who} can {can} every row")
+            else:
+                found(out, "high", r["where"], "rls-off-table",
+                      f"table {label} has row-level security off. Supabase granted new tables to anon and authenticated until "
+                      "30 Oct 2026, so wherever it did, anyone with the app's public key can read and change every row")
+        elif r["kind"] == "view" and not r["invoker"]:
+            found(out, "high", r["where"], "view-bypasses-rls",
+                  f"view {label} runs with its owner's rights and skips the row-level security of the tables it reads, "
+                  "so API users see every row the owner can see")
+
+
 def check(root):
     root = Path(root)
     out = []
@@ -379,6 +582,7 @@ def check(root):
     check_mcp_servers(root, out)
     check_codeowners(root, out)
     check_workflows(root, out)
+    check_supabase(root, out)
     out.sort(key=lambda f: (-LEVELS.index(f["level"]), f["file"], f["line"] or 0))
     return out
 

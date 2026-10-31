@@ -133,3 +133,38 @@ permissions:
 ```
 
 **cli-agent-on-untrusted.** Run the agent CLI with approvals on and a read-only token, pass outside text as a file it reads as data, and post results from a separate step that holds the token. Drop flags such as `--yolo` and `--dangerously-skip-permissions` on any event that carries outside text.
+
+## Supabase migrations
+
+Since 30 October 2026 Supabase no longer grants new tables in `public` to the API roles, so a new table answers `permission denied for table` (error 42501) until you grant it. Grant each role only what the app uses, and only after row-level security is on: on tables created before that date, `anon` and `authenticated` already hold every privilege, so row-level security is the only guard.
+
+**rls-off-table.** Turn row-level security on, add a policy for each role, then grant only the actions the app uses. Replace `notes` and `user_id` with your table and owner column.
+
+```sql
+alter table public.notes enable row level security;
+create policy "owners manage their notes" on public.notes
+  for all to authenticated
+  using (user_id = (select auth.uid()))
+  with check (user_id = (select auth.uid()));
+grant select, insert, update, delete on public.notes to authenticated;
+```
+
+A table that really is public, such as a list of countries, still gets row-level security, with a read-only policy:
+
+```sql
+alter table public.countries enable row level security;
+create policy "anyone can read countries" on public.countries for select to anon, authenticated using (true);
+grant select on public.countries to anon, authenticated;
+```
+
+**default-grant-to-anon.** Remove the default-privileges grant that exposes every new table again, and grant each table on its own as above.
+
+```sql
+alter default privileges for role postgres in schema public revoke all on tables from anon, authenticated;
+```
+
+**view-bypasses-rls.** A view runs with its owner's rights unless told otherwise, so it skips the row-level security of the tables it reads.
+
+```sql
+alter view public.my_view set (security_invoker = true);
+```

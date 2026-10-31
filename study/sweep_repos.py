@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import repo_check  # noqa: E402
 
 # Cone-mode directories; files at the repository root (.mcp.json, CODEOWNERS) always come along.
-SPARSE = [".github", ".claude", ".gemini", ".vscode", ".cursor", ".codex"]
+SPARSE = [".github", ".claude", ".gemini", ".vscode", ".cursor", ".codex", "supabase"]
 
 
 def git(*args, cwd=None):
