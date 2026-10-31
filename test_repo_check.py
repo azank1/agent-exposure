@@ -86,7 +86,8 @@ class RiskyRepo(unittest.TestCase):
         write(r / ".claude/settings.local.json", "{}")
         write(r / ".mcp.json", json.dumps({"mcpServers": {
             "gh": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_TOKEN": SECRET}},
-            "ref": {"command": "npx", "args": ["-y", "pinned-server@1.2.3"], "env": {"API_KEY": "${API_KEY}"}},
+            "ref": {"command": "npx", "args": ["-y", "pinned-server@1.2.3"], "env": {"API_KEY": "${API_KEY}",
+                    "GOOGLE_APPLICATION_CREDENTIALS": "/home/dev/keys/service-account.json", "AUTH_URL": "https://auth.example.org/v1/token"}},
             "py": {"command": "uvx", "args": ["mcp-server-fetch"]},
             "remote": {"type": "http", "url": "https://mcp.example.com", "headers": {"Authorization": "Bearer " + SECRET}}}}))
         write(r / ".vscode/mcp.json", json.dumps({"servers": {"db": {"command": "node", "args": ["db.js"], "env": {"DB_PASSWORD": SECRET}}}}))

@@ -79,8 +79,15 @@ def line_of(path, needle):
 
 
 def literal_secret(value):
+    """A credential written into the file: long, no spaces, letters and digits, not a reference, path, URL or placeholder."""
     v = str(value).strip()
-    return len(v) >= 12 and "$" not in v and not PLACEHOLDER.search(v)
+    if v.lower().startswith("bearer "):
+        v = v[7:].strip()
+    if len(v) < 16 or "$" in v or " " in v or "://" in v or v.startswith(("/", "~", ".")) or PLACEHOLDER.search(v):
+        return False
+    if re.search(r"\.(json|pem|key|p12|txt|ya?ml|env)$", v, re.I):
+        return False
+    return bool(re.search(r"[A-Za-z]", v) and re.search(r"\d", v))
 
 
 def check_claude_settings(root, out):
@@ -120,7 +127,7 @@ def check_mcp_servers(root, out):
             cmd = os.path.basename(str(spec.get("command", "")))
             pkgs = [str(a) for a in spec.get("args", []) if not str(a).startswith("-")]
             if cmd in ("npx", "bunx", "pnpx") and pkgs and not PINNED_NPX.search(pkgs[0]):
-                add(out, "medium", p, root, "unpinned-mcp-package", f"MCP server {name} runs the latest release of {pkgs[0]} on every start", pkgs[0])
+                add(out, "medium", p, root, "unpinned-mcp-package", f"MCP server {name} starts {pkgs[0]} with no version: unless it is a locked project dependency, every start runs the latest release", pkgs[0])
             if cmd == "uvx" and pkgs and "==" not in pkgs[0] and "@" not in pkgs[0]:
                 add(out, "medium", p, root, "unpinned-mcp-package", f"MCP server {name} runs the latest release of {pkgs[0]} on every start", pkgs[0])
             for field in ("env", "headers"):
