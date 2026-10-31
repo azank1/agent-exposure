@@ -69,6 +69,8 @@ NOT_A_RELATION = re.compile(r"(?:all\s+)?(?:sequences?|functions?|procedures?|ro
 SECURITY_INVOKER = re.compile(r"security_invoker\s*(?:=\s*(?:true|on|1|yes)\b|(?=[,)]))", re.I)
 ENABLE_RLS = re.compile(r"enable\s+row\s+level\s+security", re.I)
 EVERY_TABLE = re.compile(r"\bpg_tables\b|information_schema\.tables|\bpg_class\b", re.I)
+LISTED = re.compile(r"(?:array\s*\[|\bin\s*\()([^\])]*)[\])]", re.I)
+LITERAL_RLS = re.compile(rf"'\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?{SQL_QNAME}\s+enable\s+row\s+level\s+security", re.I)
 DML = ("select", "insert", "update", "delete")
 
 FIXES = {
@@ -448,6 +450,18 @@ def sql_roles(text):
     return {r.strip().strip('"').lower() for r in text.split(",") if r.strip()}
 
 
+def rls_loop_targets(body):
+    """The tables a DO block switches row-level security on for: the names it lists or spells out, or None when it
+    loops over the catalog (every table)."""
+    if not ENABLE_RLS.search(body):
+        return set()
+    names = {n for group in LISTED.findall(body) for n in re.findall(r"'([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?)'", group)}
+    names |= {f"{m.group(1) or 'public'}.{m.group(2)}" for m in LITERAL_RLS.finditer(body)}
+    if names:
+        return names
+    return None if EVERY_TABLE.search(body) else set()
+
+
 def found(out, level, where, rule, message):
     out.append({"level": level, "file": where[0], "line": where[1], "rule": rule, "message": message})
 
@@ -486,9 +500,16 @@ def check_migrations(root, out, files, exposed):
             if any(ENABLE_RLS.search(b) and "pg_event_trigger_ddl_commands" in b for b in inside):
                 auto_rls = True  # an event-trigger function that switches RLS on for each new table
             if re.match(r"do\b", stmt, re.I):
-                if any(ENABLE_RLS.search(b) and EVERY_TABLE.search(b) for b in inside):
-                    for r in rels.values():  # a loop that switches RLS on for every existing table
-                        r["rls"] = r["rls"] or r["kind"] == "table"
+                for b in inside:
+                    targets = rls_loop_targets(b)
+                    if targets is None:  # a loop over the catalog: every existing table
+                        targets = [f"{k[0]}.{k[1]}" for k, r in rels.items() if r["kind"] == "table"]
+                    for t in targets:
+                        schema, _, name = t.rpartition(".")
+                        for key in ((schema.strip('"') or "public", name.strip('"')), (schema.strip('"').lower() or "public", name.strip('"').lower())):
+                            if key in rels and rels[key]["kind"] == "table":
+                                rels[key]["rls"] = True
+                                break
             elif c := CREATE_TABLE.match(stmt):
                 key = sql_qualify(c.group(3), c.group(4))
                 if not c.group(1) and not (c.group(2) and key in rels):
@@ -527,11 +548,13 @@ def check_migrations(root, out, files, exposed):
                 for schema in schemas:
                     for role in roles:
                         defaults.setdefault(schema, {}).setdefault(role, set()).update(privs)
-                api_roles = roles & {"anon", "public", "authenticated"}
+                api_roles, anyone = roles & {"anon", "public", "authenticated"}, roles & {"anon", "public"}
                 if privs and api_roles and (schemas == [None] or set(schemas) & exposed):
-                    found(out, "high" if roles & {"anon", "public"} else "medium", where, "default-grant-to-anon",
+                    who = "anyone with the app's public key" if anyone else "any signed-in user"
+                    found(out, "high" if anyone else "medium", where, "default-grant-to-anon",
                           f"default privileges grant {', '.join(sorted(privs))} on every new table to {', '.join(sorted(api_roles))}: "
-                          "that undoes Supabase's 30 Oct 2026 change, so each table created without row-level security is open to them")
+                          f"tables created later are reachable through the API as before Supabase's 30 Oct 2026 change, "
+                          f"so any of them without row-level security is open to {who}")
             elif c := GRANT.match(stmt):
                 verb, privs, target, roles = c.group(1).lower(), sql_privileges(c.group(2)), c.group(3).strip(), sql_roles(c.group(4))
                 if s := re.match(r"all\s+tables\s+in\s+schema\s+(.+)", target, re.I | re.S):
@@ -563,7 +586,7 @@ def check_migrations(root, out, files, exposed):
                 privs = anon or signed_in
                 can = " and ".join(word for word, ok in (("read", "select" in privs), ("change", privs - {"select"})) if ok)
                 who = "anyone with the app's public key" if anon else "any signed-in user"
-                found(out, "critical" if anon else "high", r["where"], "rls-off-table",
+                found(out, "critical" if anon and privs - {"select"} else "high", r["where"], "rls-off-table",
                       f"table {label} has row-level security off and is granted to {'anon' if anon else 'authenticated'}: {who} can {can} every row")
             else:
                 found(out, "high", r["where"], "rls-off-table",

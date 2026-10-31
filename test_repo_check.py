@@ -482,6 +482,11 @@ class SupabaseMigrations(unittest.TestCase):
         self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "critical")])
         self.assertIn("read and change every row", f[0][2])
 
+    def test_rls_off_table_readable_by_anon_is_high(self):
+        f = self.findings("create table public.holidays (day date);\ngrant select on public.holidays to anon;\n")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "high")])
+        self.assertIn("anyone with the app's public key can read every row", f[0][2])
+
     def test_rls_off_table_without_grants_is_high(self):
         f = self.findings("-- profiles\n\ncreate table profiles (id uuid primary key, email text);\n")
         self.assertEqual([(r, lv, line) for r, lv, _, line in f], [("rls-off-table", "high", 3)])
@@ -504,6 +509,23 @@ do $$ declare r record; begin
     execute format('alter table public.%I enable row level security', r.tablename);
   end loop;
 end $$;"""), [])
+
+    def test_do_block_enabling_rls_on_listed_tables(self):
+        f = self.findings("""create table if not exists people (id int);
+create table if not exists notes (id int);
+create table if not exists forgotten (id int);
+do $$ declare t text; begin
+  foreach t in array array['people',
+                           'notes'] loop
+    execute format('alter table %I enable row level security', t);
+  end loop;
+end $$;""")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "high")])
+        self.assertIn("public.forgotten", f[0][2])
+
+    def test_do_block_with_a_literal_statement(self):
+        self.assertEqual(self.findings("create table public.audit (id int);\n"
+                                       "do $$ begin execute 'alter table public.audit enable row level security'; end $$;"), [])
 
     def test_event_trigger_enabling_rls_on_new_tables(self):
         self.assertEqual(self.findings("""create or replace function rls_auto_enable() returns event_trigger language plpgsql as $fn$
