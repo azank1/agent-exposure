@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Render study/out/summary.json as study/RESULTS.md: aggregate rates only, no repository names."""
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -20,9 +21,11 @@ def pct(n, d):
 
 def main(path=HERE / "out/summary.json"):
     s = json.loads(Path(path).read_text())
+    commit = s.get("tool_commit") or subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=HERE, capture_output=True, text=True).stdout.strip()
     lines = ["# What public repositories ship to their AI agents", "",
              f"Sample taken {s['date']} with [`public_repos.py`](public_repos.py): {s['method']}. "
              "Up to 300 code-search hits per category, each checked with the agent-check rules in [`repo_check.py`](../repo_check.py). "
+             f"Rules as of commit `{commit}`. "
              "Code search ranks by relevance, not at random, so read these as rates in a large sample, not as exact population figures. "
              "Only aggregate counts are published. Repositories with serious findings are contacted privately and are not named here.", ""]
     for cat, c in s["categories"].items():

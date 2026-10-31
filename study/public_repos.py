@@ -96,10 +96,13 @@ def main(argv=None):
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     only = [c for c in a.only.split(",") if c]
-    summary = {"date": datetime.date.today().isoformat(), "method": "GitHub code search sample, default branches, forks excluded", "categories": {}}
+    commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=Path(__file__).resolve().parent, capture_output=True, text=True).stdout.strip()
+    summary = {"date": datetime.date.today().isoformat(), "tool_commit": commit,
+               "method": "GitHub code search sample, default branches, forks excluded", "categories": {}}
     triage = []
     if only:
         summary = json.loads((out / "summary.json").read_text())
+        summary["tool_commit"] = commit
         triage = [t for t in json.loads((out / "triage.json").read_text()) if t["category"] not in only]
     for cat, query in CATEGORIES.items():
         if only and cat not in only:
