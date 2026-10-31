@@ -36,7 +36,12 @@ TRUSTED_GATE = re.compile(r"author_association|github\.actor\s*==|user\.login\s*
 AGENT_CLI = re.compile(r"(?:^|[\s;&|(])(?:npx\s+)?(@anthropic-ai/claude-code|claude|@openai/codex|codex|@google/gemini-cli|gemini|aider|opencode|goose|cursor-agent|qwen|copilot)(?:@[\w.^~-]+)?\s+(?:-p\b|--print\b|exec\b|run\b|--prompt\b|--message\b|--yolo\b|-y\b|--approval-mode\b|--yes\b)", re.M)
 DANGEROUS_CLI_FLAGS = re.compile(r"--yolo\b|(?:^|\s)-y(?=\s|$)|--approval-mode[= ]+yolo\b|--dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox|--full-auto\b|--allow-all-tools\b|--permission-mode[= ]+bypassPermissions|--yes-always\b", re.M)
 STRONG_SCOPES = {"contents", "actions", "packages", "deployments", "pages"}
-PR_HEAD_REF = re.compile(r"github\.(?:event\.pull_request\.head\.(?:sha|ref)|head_ref)|refs/pull/")
+# The pull request head, however it is reached: event fields, github.head_ref, refs/pull/N/head, or a step output
+# such as steps.pr.outputs.head_sha (comment-triggered jobs have no pull_request payload).
+PR_HEAD_REF = re.compile(r"refs/pull/|head[._](?:sha|ref)\b")
+GH_PR_CHECKOUT = re.compile(r"\bgh\s+pr\s+checkout\b")
+# Events whose jobs hold the base repository's token and secrets even when a fork's pull request triggers them.
+PRIVILEGED_PR_EVENTS = ("pull_request_target", "issue_comment")
 AGENT_ACTIONS = {
     "anthropics/claude-code-action": "Claude Code",
     "anthropics/claude-code-base-action": "Claude Code",
@@ -57,7 +62,7 @@ FIXES = {
     "plaintext-secret": "Rotate the credential now, then reference an environment variable instead (${VAR}).",
     "unpinned-mcp-package": "Pin an exact version (package@1.2.3) and review upgrades like any other dependency.",
     "no-codeowners": "Add CODEOWNERS entries for .claude/, .mcp.json and .github/workflows/ so changes need an owner's review.",
-    "pwn-request": "Never check out pull request code in a pull_request_target job; split it into an unprivileged pull_request build.",
+    "pwn-request": "Never check out pull request code in a pull_request_target or issue_comment job, and never start an agent inside it: an agent may load that code's own agent config. Build it in an unprivileged pull_request workflow, and limit comment commands to trusted authors.",
     "shell-injection": "Pass the value through env: and quote it in the script instead of using ${{ }} inside run:.",
     "agent-open-to-anyone": "Restrict who can trigger the agent: remove '*' and list specific trusted users, or drop the input.",
     "agent-unrestricted": "Remove the flag; give the agent a narrow tool list and a sandbox instead.",
@@ -199,6 +204,7 @@ def check_workflows(root, out):
             continue
         events = triggers(doc)
         untrusted = sorted(events & UNTRUSTED_EVENTS)
+        privileged = [e for e in PRIVILEGED_PR_EVENTS if e in events]
         jobs = doc.get("jobs")
         for job_id, job in (jobs.items() if isinstance(jobs, dict) else []):
             if not isinstance(job, dict):
@@ -212,8 +218,13 @@ def check_workflows(root, out):
                 uses = str(step.get("uses", ""))
                 run = str(step.get("run", ""))
                 with_ = step.get("with") if isinstance(step.get("with"), dict) else {}
-                if "pull_request_target" in events and uses.startswith("actions/checkout") and PR_HEAD_REF.search(str(with_.get("ref", ""))):
-                    check_pr_checkout(root, out, p, job_id, job, steps[i + 1:], with_, perms)
+                gh_checkout = GH_PR_CHECKOUT.search(run) if privileged else None
+                if privileged and uses.startswith("actions/checkout") and PR_HEAD_REF.search(str(with_.get("ref", ""))):
+                    check_pr_checkout(root, out, p, job_id, job, steps[i + 1:], with_, perms, privileged)
+                elif gh_checkout:
+                    # the rest of this script runs on the pull request code too
+                    later = [{"run": run[gh_checkout.end():]}] + steps[i + 1:]
+                    check_pr_checkout(root, out, p, job_id, job, later, {"ref": "gh pr checkout"}, perms, privileged)
                 m = UNTRUSTED_TEXT.search(run)
                 if m:
                     add(out, "high", p, root, "shell-injection", f"job {job_id} pastes {m.group(0)} }}}} into a shell script: anyone who can set that text can run commands", m.group(0))
@@ -225,8 +236,8 @@ def check_workflows(root, out):
                     check_cli_agent(root, out, p, job_id, run, env_text, untrusted, perms)
 
 
-def check_pr_checkout(root, out, p, job_id, job, later, checkout, perms):
-    """Pull request code checked out in a privileged pull_request_target job: grade by what runs on it."""
+def check_pr_checkout(root, out, p, job_id, job, later, checkout, perms, privileged):
+    """Pull request code checked out in a job that holds the base repo's token and secrets: grade by what runs on it."""
     pr_dir = str(checkout.get("path") or "").strip().strip("./")
 
     def on_pr_code(st):
@@ -260,7 +271,7 @@ def check_pr_checkout(root, out, p, job_id, job, later, checkout, perms):
     if gated:
         level = LEVELS[max(0, LEVELS.index(level) - 1)]
         what += "; the job is limited to trusted authors or a protected environment"
-    add(out, level, p, root, "pwn-request", f"job {job_id} checks out pull request code under pull_request_target, {what}", str(checkout.get("ref")))
+    add(out, level, p, root, "pwn-request", f"job {job_id} checks out pull request code under {' and '.join(privileged)}, {what}", str(checkout.get("ref")))
 
 
 def check_cli_agent(root, out, p, job_id, run, env_text, untrusted, perms):

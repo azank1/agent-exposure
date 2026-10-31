@@ -282,6 +282,106 @@ class PrCheckoutGrading(unittest.TestCase):
         self.assertEqual(self.level(GATED_EXEC_WF), ["high"])
 
 
+COMMENT_EXEC_WF = """
+on:
+  issue_comment: {types: [created]}
+permissions:
+  contents: write
+jobs:
+  test:
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/test')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/head
+      - run: npm ci && npm test
+"""
+
+COMMENT_GATED_WF = COMMENT_EXEC_WF.replace(
+    "if: github.event.issue.pull_request && contains(github.event.comment.body, '/test')",
+    "if: github.event.comment.author_association == 'MEMBER'")
+
+COMMENT_GH_CHECKOUT_WF = """
+on:
+  issue_comment: {types: [created]}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          gh pr checkout ${{ github.event.issue.number }}
+          make build
+        env:
+          GH_TOKEN: ${{ github.token }}
+"""
+
+COMMENT_STEP_OUTPUT_WF = """
+on:
+  issue_comment: {types: [created]}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - id: pr
+        uses: xt0rted/pull-request-comment-branch@v2
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+      - run: ./scripts/test.sh
+"""
+
+COMMENT_DEFAULT_BRANCH_WF = """
+on:
+  issue_comment: {types: [created]}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci && npm test
+"""
+
+PULL_REQUEST_GH_CHECKOUT_WF = """
+on: [pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          gh pr checkout ${{ github.event.pull_request.number }}
+          make build
+"""
+
+
+class CommentTriggeredCheckout(unittest.TestCase):
+    def findings(self, wf):
+        with tempfile.TemporaryDirectory() as d:
+            write(Path(d) / ".github/workflows/w.yml", wf)
+            return [x for x in json.loads(run(d, "--json", "--fail-on", "none").stdout) if x["rule"] == "pwn-request"]
+
+    def test_comment_job_running_pr_code_is_critical(self):
+        f = self.findings(COMMENT_EXEC_WF)
+        self.assertEqual([x["level"] for x in f], ["critical"])
+        self.assertIn("issue_comment", f[0]["message"])
+
+    def test_trusted_commenter_gate_lowers_one_level(self):
+        self.assertEqual([x["level"] for x in self.findings(COMMENT_GATED_WF)], ["high"])
+
+    def test_gh_pr_checkout_counts_as_checkout(self):
+        self.assertEqual([x["level"] for x in self.findings(COMMENT_GH_CHECKOUT_WF)], ["critical"])
+
+    def test_head_sha_from_a_step_output(self):
+        self.assertEqual([x["level"] for x in self.findings(COMMENT_STEP_OUTPUT_WF)], ["critical"])
+
+    def test_default_branch_checkout_is_not_flagged(self):
+        self.assertEqual(self.findings(COMMENT_DEFAULT_BRANCH_WF), [])
+
+    def test_unprivileged_pull_request_event_is_not_flagged(self):
+        self.assertEqual(self.findings(PULL_REQUEST_GH_CHECKOUT_WF), [])
+
+
 CLI_AGENT_WF = """
 on:
   issues: {types: [opened]}

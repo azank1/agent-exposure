@@ -39,7 +39,7 @@ What it flags:
 - **MCP configs** (`.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`, `.gemini/settings.json`, `.codex/config.toml`): unpinned `npx`/`uvx` packages, and credentials written into the file instead of referenced as `${VAR}`;
 - **agent workflows** (`anthropics/claude-code-action`, `openai/codex-action`, `google-github-actions/run-gemini-cli`): anyone allowed to trigger the agent (`'*'`), sandbox or approval checks turned off, unrestricted shell tools, issue or PR text pasted into the prompt, write permissions on events that carry outside text, no `permissions:` block. An agent step given an empty `GITHUB_TOKEN` is not charged with the job's write scopes, unless `actions/checkout` left credentials in `.git/config`;
 - **agent CLIs started from `run:` steps** (`claude -p`, `codex exec`, `gemini`, `aider` and others) on events that carry outside text, graded higher when approvals are skipped (`--yolo`, `--dangerously-skip-permissions`);
-- **the two classic workflow holes** on the same channel: checking out pull request code under `pull_request_target`, and `${{ github.event.issue.title }}`-style text inside `run:`.
+- **the two classic workflow holes** on the same channel: checking out pull request code in a job that holds the base repository's token (`pull_request_target`, or a comment trigger such as `issue_comment`, including `gh pr checkout`), and `${{ github.event.issue.title }}`-style text inside `run:`.
 
 Severity follows what the job can actually do: checked-out pull request code that is never executed, or a job limited to trusted authors, grades lower. A workflow file that does not parse is reported, not skipped.
 
