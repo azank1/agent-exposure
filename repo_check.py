@@ -28,7 +28,7 @@ except ImportError:  # workflow checks need PyYAML; config checks do not
 LEVELS = ["low", "medium", "high", "critical"]
 MARKS = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "⚪"}
 FIX_GUIDE = "https://github.com/azank1/agent-exposure/blob/main/docs/fixes.md"
-FIX_FOR_YOU = "https://azank1.github.io/offer-site/"
+FIX_FOR_YOU = "https://x.com/azankhyder"
 UNTRUSTED_EVENTS = {"issues", "issue_comment", "pull_request_target", "pull_request_review",
                     "pull_request_review_comment", "discussion", "discussion_comment"}
 UNTRUSTED_TEXT = re.compile(
@@ -644,7 +644,7 @@ def report(name, findings):
         if rule in FIXES:
             lines.append(f"- **{rule}**: {FIXES[rule]}")
     lines += ["", f"The safe setting for each rule, with examples: [docs/fixes.md]({FIX_GUIDE}). "
-                  f"Rather have them fixed? [One fixed-price pull request]({FIX_FOR_YOU})."]
+                  f"Rather have them fixed? One fixed-price pull request: message [@azankhyder on X]({FIX_FOR_YOU})."]
     return "\n".join(lines) + "\n"
 
 
