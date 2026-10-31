@@ -80,6 +80,14 @@ NAME_SKIPPED = re.compile(NAME_COLUMN + r"(?:not\s+in\s*\(([^)]*)\)|(?:<>|!=)\s*
 SCHEMA_EQUALS = re.compile(r"\b(?:schemaname|table_schema|nspname|relnamespace)\b\s*=\s*'([^']*)'", re.I)
 LISTED = re.compile(r"(?:array\s*\[|(?<!\bnot\s)\bin\s*\()([^\])]*)[\])]", re.I)
 SPELLED_RLS = re.compile(rf"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?{SQL_QNAME}\s+enable\s+row\s+level\s+security", re.I)
+CREATE_POLICY = re.compile(rf"create\s+policy\s+({SQL_IDENT})\s+on\s+(?:only\s+)?{SQL_QNAME}(.*)", re.I | re.S)
+ALTER_POLICY = re.compile(rf"alter\s+policy\s+({SQL_IDENT})\s+on\s+{SQL_QNAME}(.*)", re.I | re.S)
+DROP_POLICY = re.compile(rf"drop\s+policy\s+(?:if\s+exists\s+)?({SQL_IDENT})\s+on\s+{SQL_QNAME}", re.I)
+POLICY_CLAUSE = re.compile(r"\b(using|with\s+check)\s*\(", re.I)
+ALWAYS_TRUE = re.compile(r"[\s(]*(?:true|1\s*=\s*1)[\s)]*", re.I)
+SIGNED_IN = re.compile(r"[\s(]*(?:select\s+)?auth\.(?:uid\(\)(?:\s+as\s+\w+)?[\s)]*is\s+not\s+null"
+                       r"|role\(\)(?:\s+as\s+\w+)?[\s)]*=\s*'authenticated'(?:::text)?)[\s)]*", re.I)
+ACTIONS = {"select": "read", "insert": "add", "update": "change", "delete": "delete"}
 DML = ("select", "insert", "update", "delete")
 
 FIXES = {
@@ -102,6 +110,7 @@ FIXES = {
     "rls-off-table": "Enable row-level security on the table and add a policy for each role, then grant each role only the actions the app uses. Never fix 'permission denied' by granting everything to anon.",
     "default-grant-to-anon": "Remove the default-privileges grant and grant each new table explicitly, after enabling row-level security on it.",
     "view-bypasses-rls": "Create the view with (security_invoker = true) so it applies the row-level security of the tables it reads, or revoke it from anon and authenticated.",
+    "rls-policy-always-true": "Give the policy a condition on the row, such as user_id = (select auth.uid()), and a TO clause naming only the roles that need it. Keep using (true) for reading public data.",
 }
 
 
@@ -438,9 +447,12 @@ def sql_code(text):
     return "".join(code), bodies
 
 
+def sql_ident(t):
+    return t[1:-1] if t.startswith('"') else t.lower()
+
+
 def sql_qualify(schema, name):
-    ident = lambda t: t[1:-1] if t.startswith('"') else t.lower()
-    return (ident(schema) if schema else "public", ident(name))
+    return (sql_ident(schema) if schema else "public", sql_ident(name))
 
 
 def sql_names(text):
@@ -470,6 +482,44 @@ def rls_loop_targets(body):
     if EVERY_TABLE.search(body) and DYNAMIC_RLS.search(body) and not (NAME_FILTER.search(body) and listed):
         return True, quoted("".join(g) for g in NAME_SKIPPED.findall(body)), set(SCHEMA_EQUALS.findall(body))
     return False, listed | {f"{m.group(1) or 'public'}.{m.group(2)}" for m in SPELLED_RLS.finditer(body)}, set()
+
+
+def sql_policy(code, raw):
+    """A policy's clauses from the text after 'on <table>'. The clauses are found in the code, where comments and strings
+    are blanked, and each expression is read from the raw text at the same place. None marks a clause that is absent."""
+    exprs, pos, head = {}, 0, code
+    while m := POLICY_CLAUSE.search(code, pos):
+        head = code[:m.start()] if not exprs else head
+        depth, i = 1, m.end()
+        while i < len(code) and depth:
+            depth += {"(": 1, ")": -1}.get(code[i], 0)
+            i += 1
+        exprs.setdefault("using" if m.group(1).lower() == "using" else "check", raw[m.end():i - 1].strip())
+        pos = i
+    cmd, to = re.search(r"\bfor\s+(all|select|insert|update|delete)\b", head, re.I), re.search(r"\bto\s+(.+)", head, re.I | re.S)
+    return {"restrictive": bool(re.search(r"\bas\s+restrictive\b", head, re.I)), "cmd": cmd and cmd.group(1).lower(),
+            "roles": to and sql_roles(to.group(1)), "using": exprs.get("using"), "check": exprs.get("check")}
+
+
+def policy_reach(p):
+    """What a permissive policy lets through on every row, as (actions for anyone with the app's public key, actions for
+    any signed-in user): its condition is always true, or only checks that the user is signed in."""
+    roles, cmd = p["roles"] or {"public"}, p["cmd"] or "all"
+    anyone, signed = set(), set()
+    for action in (DML if cmd == "all" else (cmd,)) if not p["restrictive"] else ():
+        expr = (p["check"] or (p["using"] if cmd == "all" else None)) if action == "insert" else p["using"]
+        if expr is not None and ALWAYS_TRUE.fullmatch(expr):
+            anyone |= {action} if roles & {"anon", "public"} else set()
+            signed |= {action} if roles & {"public", "authenticated"} else set()
+        elif expr is not None and SIGNED_IN.fullmatch(expr) and roles & {"public", "authenticated"}:
+            signed.add(action)
+    return anyone, signed
+
+
+def say_actions(actions):
+    rows = [ACTIONS[a] for a in DML if a in actions - {"insert"}]
+    said = (", ".join(rows[:-1]) + " and " + rows[-1] if len(rows) > 1 else "".join(rows)) + " every row" if rows else ""
+    return said + (", and add rows" if rows and "insert" in actions else "add rows" if "insert" in actions else "")
 
 
 def found(out, level, where, rule, message):
@@ -508,6 +558,21 @@ def check_migrations(root, out, files, exposed):
                 grants.setdefault(role, set()).update(privs)
         return grants
 
+    def replay_policy(stmt, raw, where):
+        if c := DROP_POLICY.match(stmt):
+            if (r := rels.get(sql_qualify(c.group(2), c.group(3)))) and r["kind"] == "table":
+                r["policies"].pop(sql_ident(c.group(1)), None)
+        elif (c := CREATE_POLICY.match(stmt) or ALTER_POLICY.match(stmt)) and \
+                (r := rels.get(sql_qualify(c.group(2), c.group(3)))) and r["kind"] == "table":
+            name, parsed = sql_ident(c.group(1)), sql_policy(c.group(4), raw[c.start(4):])
+            if stmt[:6].lower() == "create":
+                r["policies"][name] = dict(parsed, where=where)
+            elif rn := re.match(rf"\s*rename\s+to\s+({SQL_IDENT})", c.group(4), re.I):
+                if name in r["policies"]:
+                    r["policies"][sql_ident(rn.group(1))] = r["policies"].pop(name)
+            elif name in r["policies"]:
+                r["policies"][name].update({k: v for k, v in parsed.items() if k in ("roles", "using", "check") and v is not None})
+
     for p in files:
         text = p.read_text(encoding="utf-8", errors="ignore")
         code, bodies = sql_code(text)
@@ -517,11 +582,11 @@ def check_migrations(root, out, files, exposed):
                 continue
             at = m.end() - len(stmt)
             where = (os.path.relpath(p, root), text.count("\n", 0, at) + 1)
-            inside = [b for o, b in bodies if m.start() <= o < m.end()]
-            if any(ENABLE_RLS.search(b) and "pg_event_trigger_ddl_commands" in b for b in inside):
+            inside = [(o, b) for o, b in bodies if m.start() <= o < m.end()]
+            if any(ENABLE_RLS.search(b) and "pg_event_trigger_ddl_commands" in b for _, b in inside):
                 auto_rls = True  # an event-trigger function that switches RLS on for each new table
             if re.match(r"do\b", stmt, re.I):
-                for b in inside:
+                for o, b in inside:
                     every, targets, schemas = rls_loop_targets(b)
                     if every:  # a loop over the catalog: every existing table in the schemas it reads, bar the skipped
                         targets = [f"{k[0]}.{k[1]}" for k, r in rels.items() if r["kind"] == "table"
@@ -533,15 +598,23 @@ def check_migrations(root, out, files, exposed):
                                 rels[key]["rls"] = True
                                 break
                     tag = re.match(r"\$\w*\$", b).group(0)  # every body starts with its tag
-                    inner = sql_code(b[len(tag):].removesuffix(tag))[0]
+                    raw = b[len(tag):].removesuffix(tag)
+                    inner = sql_code(raw)[0]
                     for d in re.finditer(r"\bdrop\s+(?:table|view)\s+(?:if\s+exists\s+)?([^;]+)", inner, re.I):
                         for key in sql_names(d.group(1)):  # a cleanup step inside the block
                             rels.pop(key, None)
+                    for piece in re.finditer(r"[^;]+", inner):  # policies created only if missing, a common idiom
+                        if s := re.search(r"\b(?:create|alter|drop)\s+policy\b", piece.group(0), re.I):
+                            start = piece.start() + s.start()
+                            replay_policy(inner[start:piece.end()], raw[start:piece.end()],
+                                          (where[0], text.count("\n", 0, o + len(tag) + start) + 1))
+            elif re.match(r"(?:create|alter|drop)\s+policy\b", stmt, re.I):
+                replay_policy(stmt, text[at:m.end()], where)
             elif c := CREATE_TABLE.match(stmt):
                 key = sql_qualify(c.group(3), c.group(4))
                 if not c.group(1) and not (c.group(2) and key in rels):
                     rels[key] = {"kind": "table", "rls": auto_rls or key in pending, "invoker": False, "where": where,
-                                 "grants": initial_grants(key[0]), "revoked": set()}
+                                 "grants": initial_grants(key[0]), "revoked": set(), "policies": {}}
             elif c := CREATE_VIEW.match(stmt):
                 key = sql_qualify(c.group(2), c.group(3))
                 old = rels.get(key)
@@ -625,6 +698,19 @@ def check_migrations(root, out, files, exposed):
             found(out, "high", r["where"], "view-bypasses-rls",
                   f"view {label} runs with its owner's rights and skips the row-level security of the tables it reads, "
                   "so API users see every row the owner can see")
+        elif r["kind"] == "table":
+            explicit = bool(anon or signed_in or {"anon", "authenticated"} & r["revoked"])
+            for pname, pol in sorted(r["policies"].items()):
+                anyone, signed = policy_reach(pol)
+                if explicit:  # the grants bound what a policy can open; with none, the pre-30 Oct 2026 defaults applied
+                    anyone, signed = anyone & anon, signed & (signed_in | r["grants"].get("public", set()))
+                level, who, acts = (("critical", "anyone with the app's public key", anyone) if anyone & {"update", "delete"} else
+                                    ("high", "any signed-in user", signed) if signed & {"update", "delete"} else
+                                    ("low", "anyone with the app's public key", {"insert"}) if "insert" in anyone else (None, None, None))
+                if level:
+                    found(out, level, pol["where"], "rls-policy-always-true",
+                          f'policy "{pname}" on table {label} lets {who} {say_actions(acts)}: row-level security is on, but '
+                          + ("the policy never checks whose row it is" if level != "low" else "nothing limits who adds what"))
 
 
 def check(root):

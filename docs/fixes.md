@@ -168,3 +168,20 @@ alter default privileges for role postgres in schema public revoke all on tables
 ```sql
 alter view public.my_view set (security_invoker = true);
 ```
+
+**rls-policy-always-true.** Row-level security protects rows only if each policy checks whose row it is. A policy whose condition is `true`, or only checks that the user is signed in, opens every row to everyone it applies to. Replace it with one that compares the row's owner column; replace `leads` and `user_id` with your table and owner column.
+
+```sql
+drop policy "Allow all operations" on public.leads;
+create policy "owners manage their leads" on public.leads
+  for all to authenticated
+  using (user_id = (select auth.uid()))
+  with check (user_id = (select auth.uid()));
+```
+
+Keep `using (true)` for reading data that really is public, as in the countries example above. A form that anyone may submit gets an insert-only policy, and no read, update or delete policy for `anon`:
+
+```sql
+create policy "anyone can send a message" on public.contact_messages for insert to anon with check (true);
+grant insert on public.contact_messages to anon;
+```

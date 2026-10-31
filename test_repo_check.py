@@ -548,6 +548,68 @@ end $$;""")
         self.assertEqual(self.findings("create table public.audit (id int);\n"
                                        "do $$ begin execute 'alter table public.audit enable row level security'; end $$;"), [])
 
+    def test_policy_open_to_everyone_is_critical(self):
+        f = self.findings("""create table public.leads (id int, email text);
+alter table public.leads enable row level security;
+create policy "Allow all operations" on public.leads for all using (true) with check (true);""")
+        self.assertEqual([(r, lv, line) for r, lv, _, line in f], [("rls-policy-always-true", "critical", 3)])
+        self.assertIn('policy "Allow all operations" on table public.leads lets anyone with the app\'s public key '
+                      "read, change and delete every row, and add rows", f[0][2])
+
+    def test_policy_for_any_signed_in_user_is_high(self):
+        f = self.findings("""create table posts (id int, author uuid);
+alter table posts enable row level security;
+create policy "Auth users can update" on posts for update to authenticated using (true);
+create policy "Auth users can delete" on posts for delete using ((select auth.uid()) is not null);
+create policy "Signed in can edit" on posts as permissive for update using (auth.role() = 'authenticated'::text);""")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-policy-always-true", "high")] * 3)
+        self.assertIn("lets any signed-in user change every row", f[0][2])
+
+    def test_open_insert_policy_is_low_and_open_read_is_fine(self):
+        f = self.findings("""create table contacts (id int, message text);
+alter table contacts enable row level security;
+create policy "Anyone can submit" on contacts for insert to anon with check (true);
+create policy "Public read" on contacts for select using (true);""")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-policy-always-true", "low")])
+        self.assertIn("lets anyone with the app's public key add rows", f[0][2])
+
+    def test_policies_that_check_the_row_are_fine(self):
+        self.assertEqual(self.findings("""create table notes (id int, user_id uuid);
+alter table notes enable row level security;
+create policy "Owners" on notes for all to authenticated
+  using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+create policy "Limit" on notes as restrictive for all using (true);"""), [])
+
+    def test_policy_dropped_or_altered_later(self):
+        self.assertEqual(self.findings("""create table a (id int, user_id uuid);
+alter table a enable row level security;
+create policy "temp" on a for all using (true);
+create table b (id int, user_id uuid);
+alter table b enable row level security;
+create policy "temp" on b for all using (true);""",
+                                       """drop policy if exists "temp" on a;
+alter policy "temp" on b using (user_id = auth.uid());"""), [])
+
+    def test_policy_created_inside_a_do_block(self):
+        f = self.findings("""create table items (id int);
+alter table items enable row level security;
+do $$ begin
+  if not exists (select 1 from pg_policies where tablename = 'items' and policyname = 'open') then
+    create policy "open" on public.items for all using (true);
+  end if;
+end $$;""")
+        self.assertEqual([(r, lv, line) for r, lv, _, line in f], [("rls-policy-always-true", "critical", 5)])
+
+    def test_grants_bound_what_a_policy_opens(self):
+        self.assertEqual(self.findings("""create table prices (id int);
+alter table prices enable row level security;
+grant select on prices to anon;
+create policy "all" on prices for all using (true);"""), [])
+
+    def test_policy_on_a_table_without_rls_is_not_double_counted(self):
+        f = self.findings("create table t (id int);\ncreate policy p on t for all using (true);")
+        self.assertEqual([r for r, _, _, _ in f], ["rls-off-table"])
+
     def test_table_dropped_inside_a_do_block(self):
         self.assertEqual(self.findings("create table public._id_map (id int);\n"
                                        "do $$ begin\n  -- drop table public.kept;\n  drop table if exists public._id_map;\nend $$;"), [])
