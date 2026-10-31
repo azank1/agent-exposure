@@ -489,6 +489,7 @@ def check_supabase(root, out):
 def check_migrations(root, out, files, exposed):
     """Replay the migrations in order, tracking row-level security, grants and renames, then report what the API can reach."""
     rels, defaults, auto_rls = {}, {}, False  # defaults: schema (None = every schema) -> role -> privileges
+    pending = set()  # tables switched to RLS before they exist: Postgres refuses that, so the files ran in another order
 
     def initial_grants(schema):
         grants = {}
@@ -521,10 +522,15 @@ def check_migrations(root, out, files, exposed):
                             if key in rels and rels[key]["kind"] == "table":
                                 rels[key]["rls"] = True
                                 break
+                    tag = re.match(r"\$\w*\$", b).group(0)  # every body starts with its tag
+                    inner = sql_code(b[len(tag):].removesuffix(tag))[0]
+                    for d in re.finditer(r"\bdrop\s+(?:table|view)\s+(?:if\s+exists\s+)?([^;]+)", inner, re.I):
+                        for key in sql_names(d.group(1)):  # a cleanup step inside the block
+                            rels.pop(key, None)
             elif c := CREATE_TABLE.match(stmt):
                 key = sql_qualify(c.group(3), c.group(4))
                 if not c.group(1) and not (c.group(2) and key in rels):
-                    rels[key] = {"kind": "table", "rls": auto_rls, "invoker": False, "where": where,
+                    rels[key] = {"kind": "table", "rls": auto_rls or key in pending, "invoker": False, "where": where,
                                  "grants": initial_grants(key[0]), "revoked": set()}
             elif c := CREATE_VIEW.match(stmt):
                 key = sql_qualify(c.group(2), c.group(3))
@@ -537,7 +543,9 @@ def check_migrations(root, out, files, exposed):
             elif c := ALTER_RELATION.match(stmt):
                 key, rest = sql_qualify(c.group(2), c.group(3)), c.group(4)
                 r = rels.get(key)
-                if r is None:
+                if r is None:  # two files sharing a version prefix can sort this way; IF EXISTS makes it a silent no-op
+                    if ENABLE_RLS.search(rest) and not re.match(r"alter\s+table\s+if\s+exists\b", stmt, re.I):
+                        pending.add(key)
                     continue
                 if rn := re.search(rf"\brename\s+to\s+({SQL_IDENT})", rest, re.I):
                     rels[sql_qualify(f'"{key[0]}"', rn.group(1))] = rels.pop(key)

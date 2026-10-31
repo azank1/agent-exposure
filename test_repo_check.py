@@ -548,6 +548,15 @@ end $$;""")
         self.assertEqual(self.findings("create table public.audit (id int);\n"
                                        "do $$ begin execute 'alter table public.audit enable row level security'; end $$;"), [])
 
+    def test_table_dropped_inside_a_do_block(self):
+        self.assertEqual(self.findings("create table public._id_map (id int);\n"
+                                       "do $$ begin\n  -- drop table public.kept;\n  drop table if exists public._id_map;\nend $$;"), [])
+
+    def test_rls_enabled_in_a_file_that_sorts_before_the_table(self):
+        self.assertEqual(self.findings("alter table permits enable row level security;", "create table permits (id int);"), [])
+        f = self.findings("alter table if exists permits enable row level security;", "create table permits (id int);")
+        self.assertEqual([(r, lv) for r, lv, _, _ in f], [("rls-off-table", "high")])
+
     def test_existence_check_covers_only_the_table_it_names(self):
         f = self.findings("""create table plans (id int);
 create table documents (id int);
