@@ -341,9 +341,35 @@ async function entriesToItems(entry, out) {
   }
 }
 
+// The same walk over a folder opened with showDirectoryPicker (Chrome, Edge), whose prompt asks to let the page view
+// the folder. The folder input's prompt says "Upload N files to this site?" even though nothing is sent.
+async function handleToItems(handle, path, out) {
+  if (handle.kind === "file") {
+    out.push({ path, file: await handle.getFile() });
+  } else if (handle.name !== "node_modules" && handle.name !== ".git") {
+    for await (const child of handle.values()) await handleToItems(child, path + "/" + child.name, out);
+  }
+}
+
+async function chooseFolder() {
+  if (!window.showDirectoryPicker) { $("pick").click(); return; }
+  let dir;
+  try { dir = await window.showDirectoryPicker({ id: "supabase", mode: "read" }); }
+  catch (e) {
+    if (!e || e.name !== "AbortError") $("pick").click();  // refused here, say inside a frame: use the folder input
+    return;
+  }
+  return guarded(async () => {
+    const items = [];
+    await handleToItems(dir, dir.name, items);
+    await runFiles(items);
+  });
+}
+
 const drop = $("drop");
-drop.addEventListener("click", () => $("pick").click());
-drop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $("pick").click(); } });
+if (!window.showDirectoryPicker) $("drop-help").append(" Your browser may ask to upload the folder; that is its wording for any folder chooser, and nothing is sent.");
+drop.addEventListener("click", () => chooseFolder());
+drop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); chooseFolder(); } });
 drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
 drop.addEventListener("dragleave", () => drop.classList.remove("over"));
 drop.addEventListener("drop", (e) => {
@@ -374,7 +400,8 @@ $("example").addEventListener("click", () => {
 });
 fetch("version.txt", { cache: "no-cache" }).then((r) => (r.ok ? r.text() : "")).then((v) => { $("version").textContent = v.trim(); }).catch(() => {});
 
-// #selftest=1 checks the page against the released code: path placement, then three migrations with known results.
+// #selftest=1 checks the page against the released code: path placement, the folder walk and chooser, then three
+// migrations with known results.
 async function selftest() {
   const results = [];
   const expect = (name, ok) => results.push([name, Boolean(ok)]);
@@ -391,6 +418,32 @@ async function selftest() {
     { path: "repo/apps/b/supabase/migrations/2.sql", text: "" },
   ]);
   expect("monorepo: keeps the folder with more migrations", mono.group === "repo/apps/b" && mono.files.length === 2 && mono.others === 1);
+  const fakeDir = (name, kids) => ({ kind: "directory", name, async *values() { yield* kids; } });
+  const fakeFile = (name, text = "") => ({ kind: "file", name, getFile: async () => new File([text], name) });
+  const walked = [];
+  await handleToItems(fakeDir("supabase", [fakeDir("migrations", [fakeFile("001.sql")]), fakeFile("config.toml"),
+    fakeDir("node_modules", [fakeFile("x.sql")])]), "supabase", walked);
+  expect("folder walk: skips node_modules", walked.map((i) => i.path).join(",") === "supabase/migrations/001.sql,supabase/config.toml");
+  const own = Object.getOwnPropertyDescriptor(window, "showDirectoryPicker");
+  const setPicker = (value) => Object.defineProperty(window, "showDirectoryPicker", { value, configurable: true, writable: true });
+  let opened = 0;
+  $("pick").click = () => { opened++; };
+  try {
+    $("summary").textContent = "";
+    setPicker(async () => fakeDir("supabase", [fakeDir("migrations", [fakeFile("001.sql", EXAMPLE)])]));
+    await chooseFolder();
+    const picked = $("summary").textContent;
+    setPicker(async () => { throw new DOMException("The user aborted a request.", "AbortError"); });
+    await chooseFolder();
+    const quiet = opened === 0;
+    setPicker(undefined);
+    await chooseFolder();
+    expect("folder chooser: checks the picked folder, a cancel is quiet, the input is the fallback",
+      picked.startsWith("3 findings in 1 migration file") && quiet && opened === 1);
+  } finally {
+    delete $("pick").click;
+    if (own) Object.defineProperty(window, "showDirectoryPicker", own); else delete window.showDirectoryPicker;
+  }
   const sig = (r) => r.findings.map((f) => [f.level, f.rule, f.line].join(" ")).join(" | ");
   const ex = await check([{ rel: "supabase/migrations/example.sql", text: EXAMPLE }]);
   expect("example: 3 findings", sig(ex) === "critical rls-off-table 1 | critical rls-policy-always-true 6 | high view-bypasses-rls 5");
