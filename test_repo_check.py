@@ -35,6 +35,7 @@ jobs:
       - run: echo "${{ github.event.issue.title }}"
       - uses: anthropics/claude-code-action@v1
         with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           allowed_non_write_users: "*"
           claude_args: --allowedTools "Bash,Read"
           prompt: |
@@ -123,7 +124,6 @@ class RiskyRepo(unittest.TestCase):
         self.assertEqual(len(open_to_anyone), 2)  # claude allowed_non_write_users and codex allow-users
         self.assertIn("agent-unrestricted", self.rules("high"))
         self.assertIn("untrusted-text-in-prompt", self.rules("high"))
-        self.assertIn("agent-write-on-untrusted", self.rules("medium"))
         self.assertIn("agent-default-token", self.rules("low"))
         self.assertTrue(any(f["rule"] == "broad-shell-allow" and f["file"].endswith("claude.yml") for f in self.findings))
         self.assertTrue(all(f["line"] for f in self.findings if f["file"].endswith(".yml") and f["rule"] != "agent-default-token"))
@@ -143,6 +143,70 @@ class RiskyRepo(unittest.TestCase):
         out = run(self.repo, "--github", "--fail-on", "none").stdout
         self.assertIn("::error file=.claude/settings.json,line=", out)
         self.assertIn("::warning file=", out)
+
+
+READ_ONLY_TRIAGE_WF = """
+on:
+  issues: {types: [opened]}
+permissions: {}
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: openai/codex-action@v1
+        with:
+          allow-users: "*"
+          sandbox: read-only
+          prompt: Suggest labels for this issue.
+"""
+
+CLAUDE_NO_TOKEN_WF = """
+on:
+  issues: {types: [opened]}
+permissions:
+  contents: read
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: anthropics/claude-code-action@v1
+        with:
+          allowed_non_write_users: "*"
+          prompt: Label this issue.
+"""
+
+CHECKOUT_ONLY_WF = """
+on: pull_request_target
+permissions:
+  contents: read
+jobs:
+  look:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+"""
+
+
+class Calibration(unittest.TestCase):
+    def findings(self, wf):
+        with tempfile.TemporaryDirectory() as d:
+            write(Path(d) / ".github/workflows/w.yml", wf)
+            return json.loads(run(d, "--json", "--fail-on", "none").stdout)
+
+    def test_read_only_triage_is_medium(self):
+        f = [x for x in self.findings(READ_ONLY_TRIAGE_WF) if x["rule"] == "agent-open-to-anyone"]
+        self.assertEqual([x["level"] for x in f], ["medium"])
+
+    def test_claude_open_users_need_github_token(self):
+        self.assertFalse([x for x in self.findings(CLAUDE_NO_TOKEN_WF) if x["rule"] == "agent-open-to-anyone"])
+
+    def test_checkout_without_execution_is_high(self):
+        f = [x for x in self.findings(CHECKOUT_ONLY_WF) if x["rule"] == "pwn-request"]
+        self.assertEqual([x["level"] for x in f], ["high"])
 
 
 class CleanRepo(unittest.TestCase):

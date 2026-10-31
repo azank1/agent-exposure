@@ -31,6 +31,7 @@ UNTRUSTED_TEXT = re.compile(
     r"\$\{\{\s*github\.(?:event\.(?:issue\.(?:title|body)|comment\.body|review\.body|review_comment\.body"
     r"|pull_request\.(?:title|body|head\.ref|head\.label)|discussion\.(?:title|body)|head_commit\.message)"
     r"|head_ref)\b")
+STRONG_SCOPES = {"contents", "actions", "packages", "deployments", "pages"}
 PR_HEAD_REF = re.compile(r"github\.(?:event\.pull_request\.head\.(?:sha|ref)|head_ref)|refs/pull/")
 AGENT_ACTIONS = {
     "anthropics/claude-code-action": "Claude Code",
@@ -189,19 +190,28 @@ def check_workflows(root, out):
                 continue
             perms = job.get("permissions", doc.get("permissions"))
             steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
-            for step in steps:
+            for i, step in enumerate(steps):
                 uses = str(step.get("uses", ""))
                 run = str(step.get("run", ""))
                 with_ = step.get("with") if isinstance(step.get("with"), dict) else {}
                 if "pull_request_target" in events and uses.startswith("actions/checkout") and PR_HEAD_REF.search(str(with_.get("ref", ""))):
-                    add(out, "critical", p, root, "pwn-request", f"job {job_id} checks out pull request code under pull_request_target, where it runs with the base repo's secrets and token", str(with_.get("ref")))
+                    later = [agent_of(str(s.get("uses", ""))) or ("a script" if s.get("run") else None) for s in steps[i + 1:]]
+                    later = [x for x in later if x]
+                    if later:
+                        add(out, "critical", p, root, "pwn-request", f"job {job_id} checks out pull request code under pull_request_target, then runs {later[0]} over it with the base repo's secrets: the PR author controls what it reads and may run", str(with_.get("ref")))
+                    else:
+                        add(out, "high", p, root, "pwn-request", f"job {job_id} checks out pull request code under pull_request_target, a job that holds the base repo's secrets", str(with_.get("ref")))
                 m = UNTRUSTED_TEXT.search(run)
                 if m:
                     add(out, "high", p, root, "shell-injection", f"job {job_id} pastes {m.group(0)} }}}} into a shell script: anyone who can set that text can run commands", m.group(0))
-                action = uses.split("@")[0]
-                agent = next((label for prefix, label in AGENT_ACTIONS.items() if action == prefix or action.startswith(prefix + "/")), None)
+                agent = agent_of(uses)
                 if agent:
                     check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms)
+
+
+def agent_of(uses):
+    action = uses.split("@")[0]
+    return next((label for prefix, label in AGENT_ACTIONS.items() if action == prefix or action.startswith(prefix + "/")), None)
 
 
 def check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms):
@@ -209,30 +219,49 @@ def check_agent_step(root, out, p, job_id, agent, with_, untrusted, perms):
     where = f"job {job_id} ({agent})"
     if untrusted:
         where += " on " + ", ".join(untrusted)
-    for key in ("allowed_non_write_users", "allow-users"):
-        if w.get(key, "").strip() == "*":
-            add(out, "critical" if untrusted else "high", p, root, "agent-open-to-anyone", f"{where}: {key} '*' lets any GitHub user drive the agent", key)
-    if w.get("allowed_bots", "").strip() == "*":
-        add(out, "high", p, root, "agent-open-to-anyone", f"{where}: allowed_bots '*' lets any GitHub App drive the agent", "allowed_bots")
+    scopes = write_scopes(perms)
+    strong = scopes is not None and any(sc == "write-all" or sc.split(":")[0] in STRONG_SCOPES for sc in scopes)
+    unrestricted = []
     if w.get("safety-strategy") == "unsafe":
-        add(out, "high", p, root, "agent-unrestricted", f"{where}: safety-strategy unsafe gives the agent the runner's sudo and its secrets", "safety-strategy")
+        unrestricted.append(("safety-strategy", "safety-strategy unsafe gives the agent the runner's sudo and its secrets"))
     if w.get("sandbox") == "danger-full-access":
-        add(out, "high", p, root, "agent-unrestricted", f"{where}: sandbox danger-full-access turns the sandbox off", "danger-full-access")
+        unrestricted.append(("danger-full-access", "sandbox danger-full-access turns the sandbox off"))
     args = " ".join(w.get(k, "") for k in ("claude_args", "codex-args", "settings"))
     for flag in ("--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox", "--yolo", "bypassPermissions"):
         if flag in args:
-            add(out, "high", p, root, "agent-unrestricted", f"{where}: {flag} removes every approval check", flag)
+            unrestricted.append((flag, f"{flag} removes every approval check"))
     m = re.search(r"--allowed-?tools[ =]+[\"']?([^\"'\n]*)", args, re.I)
+    for needle, msg in unrestricted:
+        add(out, "high", p, root, "agent-unrestricted", f"{where}: {msg}", needle)
     if m and BROAD_BASH.search(m.group(1)):
         add(out, "high", p, root, "broad-shell-allow", f"{where}: the agent may run any shell command (--allowedTools includes unrestricted Bash)", "allowedTools")
+        unrestricted.append(("allowedTools", "unrestricted Bash"))
+
+    # Claude Code's allowed_non_write_users only takes effect when github_token is passed.
+    open_keys = [k for k in ("allowed_non_write_users", "allow-users") if w.get(k, "").strip() == "*"
+                 and (k != "allowed_non_write_users" or "github_token" in w)]
+    if w.get("allowed_bots", "").strip() == "*":
+        open_keys.append("allowed_bots")
+    for key in open_keys:
+        who = "any GitHub App" if key == "allowed_bots" else "any GitHub user"
+        if not untrusted:
+            level, power = "low", "none of this workflow's triggers carry outside text yet"
+        elif unrestricted or strong:
+            level, power = "critical", "and the agent can " + ("act without limits" if unrestricted else "write with " + ", ".join(scopes))
+        elif scopes is None or scopes:
+            level, power = "high", ("and the job's token can write (" + ", ".join(scopes) + ")") if scopes else "and the job's token gets the repository default, which may include write access"
+        else:
+            level, power = "medium", "the job is read-only, so injected instructions can only change the agent's output: later jobs must treat it as untrusted"
+        add(out, level, p, root, "agent-open-to-anyone", f"{where}: {key} '*' lets {who} drive the agent; {power}", key)
+
     t = UNTRUSTED_TEXT.search(w.get("prompt", ""))
     if t:
-        add(out, "high" if untrusted else "medium", p, root, "untrusted-text-in-prompt", f"{where}: {t.group(0)} }}}} is pasted into the agent's prompt, so whoever writes that text can instruct the agent", t.group(0))
-    scopes = write_scopes(perms)
+        risky = untrusted and (open_keys or unrestricted or scopes is None or scopes)
+        add(out, "high" if risky else "medium", p, root, "untrusted-text-in-prompt", f"{where}: {t.group(0)} }}}} is pasted into the agent's prompt, so whoever writes that text can instruct the agent", t.group(0))
     if scopes is None:
         add(out, "low", p, root, "agent-default-token", f"{where}: no permissions block, so the token gets the repository default")
-    elif scopes and untrusted:
-        add(out, "medium", p, root, "agent-write-on-untrusted", f"{where}: the agent runs on events that carry outside text, with {', '.join(scopes)}", "permissions")
+    elif scopes and untrusted and not open_keys:
+        add(out, "medium", p, root, "agent-write-on-untrusted", f"{where}: the agent reads text from outside contributors, with {', '.join(scopes)}", "permissions")
 
 
 def check(root):
