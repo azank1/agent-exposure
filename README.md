@@ -58,7 +58,7 @@ Severity follows what an outsider could actually do: pull request code that is c
 
 ### Supabase since 30 October 2026
 
-Supabase no longer exposes a new table to the API until it is granted, and its `permission denied for table` error suggests granting the table to the role that asked, often `anon`. On a table with row-level security off, an AI builder that follows that hint opens every row to anyone holding the app's public key. agent-check replays your migrations in order and flags exactly that, along with default grants that expose every future table and views that skip row-level security. The fixes, tested on Supabase's Postgres 17: [`docs/fixes.md`](docs/fixes.md#supabase-migrations).
+Supabase no longer exposes a new table to the API until it is granted, and its `permission denied for table` error suggests granting the table to the role that asked, often `anon`. On a table with row-level security off, an AI builder that follows that hint opens every row to anyone holding the app's public key. agent-check replays your migrations in order and flags exactly that, along with default grants that expose every future table and views that skip row-level security. The fixes, tested on Supabase's Postgres 17: [`docs/fixes.md`](docs/fixes.md#supabase-migrations). To try it without installing anything, [check your migrations in the browser](https://azank1.github.io/agent-exposure/); nothing is uploaded.
 
 ## Fix what it finds
 
