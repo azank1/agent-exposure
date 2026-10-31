@@ -41,7 +41,7 @@ What it flags:
 - **agent CLIs started from `run:` steps** (`claude -p`, `codex exec`, `gemini`, `aider` and others) on events that carry outside text, graded higher when approvals are skipped (`--yolo`, `--dangerously-skip-permissions`);
 - **the two classic workflow holes** on the same channel: checking out pull request code under `pull_request_target`, and `${{ github.event.issue.title }}`-style text inside `run:`.
 
-Severity follows what the job can actually do: checked-out pull request code that is never executed, or a job limited to trusted authors, grades lower. A workflow file that does not parse is reported, not skipped. Rates from a sample of 1,216 public files are in [`study/RESULTS.md`](study/RESULTS.md).
+Severity follows what the job can actually do: checked-out pull request code that is never executed, or a job limited to trusted authors, grades lower. A workflow file that does not parse is reported, not skipped.
 
 For full GitHub Actions linting, run [zizmor](https://github.com/zizmorcore/zizmor) too; agent-check covers the agent layer.
 
@@ -68,4 +68,4 @@ python3 test_repo_check.py        # Python 3.10+, needs PyYAML for the workflow 
 
 ## Help with the findings
 
-I review agent and CI exposure for teams and set up Claude Code with guardrails that fail closed: [what that covers](https://azank1.github.io/offer-site/). MIT licensed.
+If agent-check finds something you would rather not fix yourself, I fix a repository's findings in one fixed-price pull request. I also review agent and CI exposure for teams and set up Claude Code with guardrails that fail closed: [what that covers](https://azank1.github.io/offer-site/). MIT licensed.
